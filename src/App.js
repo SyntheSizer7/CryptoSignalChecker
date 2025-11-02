@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { fetchMultipleRSI, fetchOversoldHistory } from './binance';
+import { fetchMultipleRSI, fetchOversoldHistory, fetchMultipleBreakoutSignals, formatNYTime } from './binance';
 import './App.css';
 
 // Helper function to get RSI signal interpretation
@@ -138,6 +138,24 @@ const formatTime = (timestamp) => {
     return 'Invalid Date';
   }
 };
+
+// Format price for display
+const formatPrice = (price) => {
+  if (!price || isNaN(price)) return 'N/A';
+  if (price >= 1000) {
+    return price.toFixed(2);
+  } else if (price >= 1) {
+    return price.toFixed(4);
+  } else if (price >= 0.01) {
+    return price.toFixed(4);
+  } else {
+    return price.toFixed(6);
+  }
+};
+
+// Shared cryptocurrency list - same across all features
+// Order: BTC BNB ETH XRP SOL SUI DOGE ADA ASTER PEPE HYPE ENA
+const DEFAULT_SYMBOLS = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'HYPE/USDT', 'ENA/USDT'];
 
 // RSI Table Component
 const RSITable = ({ data, loading, error, onRefresh }) => {
@@ -437,18 +455,210 @@ const OversoldHistoryTable = ({ data, loading, error, onRefresh }) => {
   );
 };
 
+// Breakout Trading Signals Table Component
+const BreakoutSignalsTable = ({ data, loading, error, onRefresh }) => {
+  if (loading) {
+    return (
+      <div className="loading-mini">
+        <div className="spinner-mini"></div>
+        <span>Fetching breakout signals (this may take a while)...</span>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="error-mini">
+        <strong>Error:</strong> {error}
+      </div>
+    );
+  }
+
+  if (!data || !Array.isArray(data) || data.length === 0) {
+    return (
+      <div className="breakout-table-container">
+        <div className="breakout-table-header">
+          <h3>4H NY Time Breakout Trading Signals</h3>
+          <button onClick={onRefresh} className="refresh-btn-small">Refresh</button>
+        </div>
+        <p style={{ textAlign: 'center', padding: '2rem', opacity: 0.7 }}>
+          No breakout signals found. Click "Refresh" to fetch data.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="breakout-table-container">
+      <div className="breakout-table-header">
+        <div>
+          <h3>4H UTC+7 Breakout Trading Signals</h3>
+          <p className="breakout-subtitle">Last 7 days | BTC Only | 4H Range (High/Low) | 5m Exit/Re-entry | Detection: UTC+7 Time 11:00-15:00 | Display: UTC+7 | Risk Ratio 1:2</p>
+        </div>
+        <button onClick={onRefresh} className="refresh-btn-small" disabled={loading}>
+          {loading ? 'Loading...' : 'Refresh'}
+        </button>
+      </div>
+      <div className="breakout-info">
+        <p className="breakout-count">
+          <strong>[DATA]</strong> Found <strong>{data.length}</strong> trading signals:
+        </p>
+      </div>
+      
+      <div className="breakout-table-wrapper">
+        <table className="breakout-table">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Range (High/Low)</th>
+              <th>Time Exit</th>
+              <th>Time Reentry</th>
+              <th>Long/Short @ Price</th>
+              <th>TP/SL (1:2)</th>
+              <th>Gain %</th>
+              <th>Win/Loss</th>
+            </tr>
+          </thead>
+          <tbody>
+            {data.map((signal, index) => {
+              const isWin = signal.result === 'win';
+              const isLoss = signal.result === 'loss';
+              const isPending = signal.result === 'pending';
+              const rowClass = `breakout-row ${isWin ? 'win-row' : ''} ${isLoss ? 'loss-row' : ''} ${isPending ? 'pending-row' : ''}`;
+              
+              const directionBadge = signal.breakoutDirection === 'long' 
+                ? { text: 'LONG', color: '#6bcf7f', bgColor: 'rgba(107, 207, 127, 0.2)' }
+                : { text: 'SHORT', color: '#ff6b6b', bgColor: 'rgba(255, 107, 107, 0.2)' };
+              
+              // Calculate percentage gain from entry to take profit
+              const calculateGainPercent = () => {
+                if (!signal.entryPrice || !signal.takeProfit) return 'N/A';
+                if (signal.breakoutDirection === 'long') {
+                  // For LONG: (TP - Entry) / Entry * 100
+                  const gain = ((signal.takeProfit - signal.entryPrice) / signal.entryPrice) * 100;
+                  return gain.toFixed(2);
+                } else {
+                  // For SHORT: (Entry - TP) / Entry * 100
+                  const gain = ((signal.entryPrice - signal.takeProfit) / signal.entryPrice) * 100;
+                  return gain.toFixed(2);
+                }
+              };
+              
+              const gainPercent = calculateGainPercent();
+              
+              return (
+                <tr key={index} className={rowClass.trim()}>
+                  <td><strong>{signal.symbol}</strong></td>
+                  <td>
+                    <div className="range-info">
+                      <span className="range-item">
+                        <strong>High:</strong> ${signal.rangeHigh ? formatPrice(signal.rangeHigh) : 'N/A'}
+                      </span>
+                      <span className="range-item">
+                        <strong>Low:</strong> ${signal.rangeLow ? formatPrice(signal.rangeLow) : 'N/A'}
+                      </span>
+                    </div>
+                  </td>
+                  <td>{formatNYTime(signal.breakoutTime)}</td>
+                  <td>{formatNYTime(signal.reentryTime)}</td>
+                  <td>
+                    <span className="direction-badge" style={{ 
+                      backgroundColor: directionBadge.bgColor,
+                      color: directionBadge.color,
+                      borderColor: directionBadge.color
+                    }}>
+                      {directionBadge.text}
+                    </span>
+                    <span style={{ marginLeft: '0.5rem' }}>${formatPrice(signal.entryPrice)}</span>
+                  </td>
+                  <td>
+                    <div className="tp-sl-info">
+                      <span className="tp-sl-item">
+                        <strong>TP:</strong> ${formatPrice(signal.takeProfit)}
+                      </span>
+                      <span className="tp-sl-item">
+                        <strong>SL:</strong> ${formatPrice(signal.stopLoss)}
+                      </span>
+                    </div>
+                  </td>
+                  <td>
+                    <span style={{ 
+                      color: isWin ? '#6bcf7f' : isLoss ? '#ff6b6b' : (signal.breakoutDirection === 'long' ? '#6bcf7f' : '#ff6b6b'),
+                      fontWeight: 'bold',
+                      fontSize: '1rem'
+                    }}>
+                      {gainPercent !== 'N/A' ? (isLoss ? `-${gainPercent}%` : `+${gainPercent}%`) : gainPercent}
+                    </span>
+                  </td>
+                  <td>
+                    {isWin && (
+                      <span className="result-badge win-badge">WIN</span>
+                    )}
+                    {isLoss && (
+                      <span className="result-badge loss-badge">LOSS</span>
+                    )}
+                    {isPending && (
+                      <span className="result-badge pending-badge">PENDING</span>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="breakout-table-footer">
+        {(() => {
+          const wins = data.filter(s => s.result === 'win').length;
+          const losses = data.filter(s => s.result === 'loss').length;
+          const pending = data.filter(s => s.result === 'pending').length;
+          const completed = wins + losses;
+          const winRate = completed > 0 ? ((wins / completed) * 100).toFixed(2) : 0;
+          const lossRate = completed > 0 ? ((losses / completed) * 100).toFixed(2) : 0;
+          
+          return (
+            <>
+              <p>Total signals: <strong>{data.length}</strong></p>
+              <p style={{ marginTop: '0.5rem', fontSize: '0.9rem', opacity: 0.8 }}>
+                Win: <strong style={{ color: '#6bcf7f' }}>{wins}</strong> | 
+                Loss: <strong style={{ color: '#ff6b6b' }}>{losses}</strong> | 
+                Pending: <strong style={{ color: '#ffd93d' }}>{pending}</strong>
+              </p>
+              {completed > 0 && (
+                <>
+                  <p style={{ marginTop: '0.5rem', fontSize: '1rem', fontWeight: '600' }}>
+                    Win Rate: <strong style={{ color: winRate >= 50 ? '#6bcf7f' : '#ff6b6b', fontSize: '1.1rem' }}>
+                      {winRate}%
+                    </strong> ({wins}W / {losses}L)
+                  </p>
+                  <p style={{ marginTop: '0.5rem', fontSize: '0.95rem', opacity: 0.85 }}>
+                    Loss Rate: <strong style={{ color: '#ff6b6b' }}>
+                      {lossRate}%
+                    </strong> | Win/Loss Ratio: <strong style={{ color: wins >= losses ? '#6bcf7f' : '#ff6b6b' }}>
+                      {(wins / losses || 0).toFixed(2)}:1
+                    </strong>
+                  </p>
+                </>
+              )}
+            </>
+          );
+        })()}
+      </div>
+    </div>
+  );
+};
+
 function App() {
   const [rsiData, setRsiData] = useState({ data: null, loading: false, error: null });
   const [oversoldHistory, setOversoldHistory] = useState({ data: null, loading: false, error: null });
+  const [breakoutSignals, setBreakoutSignals] = useState({ data: null, loading: false, error: null });
 
   // Fetch RSI directly from Binance API
   const fetchRSIData = async () => {
     setRsiData(prev => ({ ...prev, loading: true, error: null }));
 
     try {
-      // Default symbols from your Python script
-      const symbols = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'HYPE/USDT', 'TAO/USDT', 'PUMP/USDT', 'ENA/USDT'];
-      const results = await fetchMultipleRSI(symbols, 14, 14);
+      const results = await fetchMultipleRSI(DEFAULT_SYMBOLS, 14, 14);
       
       setRsiData({ data: results, loading: false, error: null });
     } catch (err) {
@@ -465,8 +675,7 @@ function App() {
     setOversoldHistory(prev => ({ ...prev, loading: true, error: null }));
 
     try {
-      const symbols = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'HYPE/USDT', 'TAO/USDT', 'PUMP/USDT', 'ENA/USDT'];
-      const results = await fetchOversoldHistory(symbols, 7, 30);
+      const results = await fetchOversoldHistory(DEFAULT_SYMBOLS, 7, 30);
       
       setOversoldHistory({ data: results, loading: false, error: null });
     } catch (err) {
@@ -474,6 +683,26 @@ function App() {
         data: null, 
         loading: false, 
         error: err.message || 'Failed to fetch oversold history from Binance' 
+      });
+    }
+  };
+
+  // Fetch breakout trading signals
+  const fetchBreakoutSignals = async () => {
+    setBreakoutSignals(prev => ({ ...prev, loading: true, error: null }));
+
+    try {
+      // Check multiple cryptocurrencies for the last 3 days (11:00-15:00 UTC+7 range each day)
+      // This will check breakouts/re-entries from each day's 11:00 UTC+7 to next day 15:00 UTC+7
+      const results = await fetchMultipleBreakoutSignals(DEFAULT_SYMBOLS, 3);
+      
+      // Use all results (all 3 days of signals for all symbols)
+      setBreakoutSignals({ data: results, loading: false, error: null });
+    } catch (err) {
+      setBreakoutSignals({ 
+        data: null, 
+        loading: false, 
+        error: err.message || 'Failed to fetch breakout signals from Binance' 
       });
     }
   };
@@ -522,6 +751,16 @@ function App() {
             loading={oversoldHistory.loading}
             error={oversoldHistory.error}
             onRefresh={fetchOversoldData}
+          />
+        </div>
+
+        {/* Breakout Trading Signals Section */}
+        <div className="rsi-main-section">
+          <BreakoutSignalsTable
+            data={breakoutSignals.data}
+            loading={breakoutSignals.loading}
+            error={breakoutSignals.error}
+            onRefresh={fetchBreakoutSignals}
           />
         </div>
       </main>
