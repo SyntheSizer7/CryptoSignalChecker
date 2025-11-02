@@ -4,6 +4,145 @@ const BINANCE_BASE_URL = 'https://api.binance.com';
 // Timezone helpers (UTC+7 - Bangkok/Indochina Time)
 const UTC_PLUS_7_OFFSET_MS = 7 * 60 * 60 * 1000; // 7 hours in milliseconds
 
+// Cache Configuration
+const CACHE_PREFIX = 'crypto_signal_cache_';
+const CACHE_EXPIRY_MS = 60 * 60 * 1000; // 1 hour default expiry
+
+// Helper to get the latest candle timestamp that should be available
+// For 1h candles: returns timestamp of the most recent closed hour (e.g., if now is 14:30, returns 14:00)
+// For 5m candles: returns timestamp of the most recent closed 5-minute period
+const getLatestExpectedCandleTime = (interval = '1h') => {
+  const now = new Date();
+  const intervalMs = interval === '1h' ? 60 * 60 * 1000 : 5 * 60 * 1000; // 1 hour or 5 minutes
+  const latestClosedCandleTime = Math.floor(now.getTime() / intervalMs) * intervalMs;
+  return new Date(latestClosedCandleTime);
+};
+
+// Helper to check if a new candle should be available since last cache
+const hasNewCandleAvailable = (lastCandleTime, interval = '1h') => {
+  const latestExpected = getLatestExpectedCandleTime(interval);
+  // Check if expected latest candle is newer than what we have
+  return latestExpected.getTime() > (lastCandleTime ? new Date(lastCandleTime).getTime() : 0);
+};
+
+// Rate Limiting Configuration
+// Binance limits: 1,200 weight per minute per IP
+// We'll be conservative and limit to ~1000 requests/minute to stay safe
+const RATE_LIMIT_DELAY_MS = 250; // Base delay between requests (250ms = ~240 requests/min)
+const RATE_LIMIT_SAFETY_MARGIN = 0.8; // Use only 80% of limit to be safe
+
+/**
+ * Cache utility functions
+ */
+const CacheUtils = {
+  /**
+   * Get cached data for a key
+   * @param {string} key - Cache key
+   * @returns {Object|null} Cached data with timestamp, or null if not found/expired
+   */
+  get: (key) => {
+    try {
+      const cached = localStorage.getItem(CACHE_PREFIX + key);
+      if (!cached) return null;
+      
+      const { data, timestamp, expiry } = JSON.parse(cached);
+      const now = Date.now();
+      
+      // Check if cache is expired
+      if (expiry && now > timestamp + expiry) {
+        CacheUtils.remove(key);
+        return null;
+      }
+      
+      return { data, timestamp };
+    } catch (error) {
+      console.warn(`Cache get error for key ${key}:`, error);
+      return null;
+    }
+  },
+  
+  /**
+   * Set cached data for a key
+   * @param {string} key - Cache key
+   * @param {*} data - Data to cache
+   * @param {number} expiry - Expiry time in milliseconds (optional)
+   */
+  set: (key, data, expiry = CACHE_EXPIRY_MS) => {
+    try {
+      const cacheEntry = {
+        data,
+        timestamp: Date.now(),
+        expiry
+      };
+      localStorage.setItem(CACHE_PREFIX + key, JSON.stringify(cacheEntry));
+    } catch (error) {
+      console.warn(`Cache set error for key ${key}:`, error);
+      // If quota exceeded, try to clear old cache
+      if (error.name === 'QuotaExceededError') {
+        CacheUtils.clearOld();
+      }
+    }
+  },
+  
+  /**
+   * Remove cached data for a key
+   * @param {string} key - Cache key
+   */
+  remove: (key) => {
+    try {
+      localStorage.removeItem(CACHE_PREFIX + key);
+    } catch (error) {
+      console.warn(`Cache remove error for key ${key}:`, error);
+    }
+  },
+  
+  /**
+   * Clear all cache entries
+   */
+  clear: () => {
+    try {
+      const keys = Object.keys(localStorage);
+      keys.forEach(key => {
+        if (key.startsWith(CACHE_PREFIX)) {
+          localStorage.removeItem(key);
+        }
+      });
+    } catch (error) {
+      console.warn('Cache clear error:', error);
+    }
+  },
+  
+  /**
+   * Clear old cache entries (older than 24 hours)
+   */
+  clearOld: () => {
+    try {
+      const keys = Object.keys(localStorage);
+      const now = Date.now();
+      const maxAge = 24 * 60 * 60 * 1000; // 24 hours
+      
+      keys.forEach(key => {
+        if (key.startsWith(CACHE_PREFIX)) {
+          try {
+            const cached = localStorage.getItem(key);
+            if (cached) {
+              const { timestamp } = JSON.parse(cached);
+              if (now - timestamp > maxAge) {
+                localStorage.removeItem(key);
+              }
+            }
+          } catch (e) {
+            // Invalid cache entry, remove it
+            localStorage.removeItem(key);
+          }
+        }
+      });
+    } catch (error) {
+      console.warn('Cache clearOld error:', error);
+    }
+  }
+};
+
 /**
  * Convert UTC+7 time to UTC time (for Binance API queries)
  * @param {Date|number} utcPlus7Time - Date object or timestamp in UTC+7
@@ -59,6 +198,17 @@ export const getBinanceKlines = async (symbol, interval = '1h', limit = 168, end
     const response = await fetch(`${url}?${params.toString()}`);
     
     if (!response.ok) {
+      // Handle rate limit errors
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After');
+        const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000; // Default 60 seconds
+        console.warn(`[Rate Limit] Binance API rate limit exceeded. Waiting ${waitTime/1000}s before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        // Retry once after waiting
+        return getBinanceKlines(symbol, interval, limit, endTime);
+      } else if (response.status === 418) {
+        throw new Error(`Binance API: IP banned (418). Please wait before retrying.`);
+      }
       throw new Error(`Binance API error: ${response.status} ${response.statusText}`);
     }
 
@@ -95,6 +245,17 @@ export const getBinancePrice = async (symbol) => {
     const response = await fetch(url);
     
     if (!response.ok) {
+      // Handle rate limit errors
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After');
+        const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : 60000; // Default 60 seconds
+        console.warn(`[Rate Limit] Binance API rate limit exceeded. Waiting ${waitTime/1000}s before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+        // Retry once after waiting
+        return getBinancePrice(symbol);
+      } else if (response.status === 418) {
+        throw new Error(`Binance API: IP banned (418). Please wait before retrying.`);
+      }
       throw new Error(`Binance API error: ${response.status} ${response.statusText}`);
     }
 
@@ -371,26 +532,82 @@ export const fetchRSIFromBinance = async (symbol, period = 14, maPeriod = 14) =>
 };
 
 /**
- * Fetch RSI for multiple symbols
+ * Fetch RSI for multiple symbols (with caching)
  * @param {Array<string>} symbols - Array of trading pairs
  * @param {number} period - RSI period
  * @param {number} maPeriod - Moving average period
+ * @param {boolean} forceRefresh - Force refresh from API (skip cache)
  * @returns {Promise<Array>} Array of RSI data objects
  */
-export const fetchMultipleRSI = async (symbols = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'HYPE/USDT', 'ENA/USDT'], period = 14, maPeriod = 14) => {
+export const fetchMultipleRSI = async (symbols = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'ENA/USDT'], period = 14, maPeriod = 14, forceRefresh = false) => {
   try {
-    const results = await Promise.all(
-      symbols.map(symbol => 
-        fetchRSIFromBinance(symbol, period, maPeriod)
-          .catch(error => {
-            console.error(`Error fetching RSI for ${symbol}:`, error);
-            return null;
-          })
-      )
-    );
+    const cacheKey = `rsi_multiple_${symbols.join('_')}_${period}_${maPeriod}`;
+    
+    // Check cache first (unless force refresh)
+    if (!forceRefresh) {
+      const cached = CacheUtils.get(cacheKey);
+      if (cached && cached.data && Array.isArray(cached.data) && cached.data.length > 0) {
+        // Find the latest timestamp from cached data
+        const latestCachedTimestamp = cached.data
+          .map(item => item.timestamp ? new Date(item.timestamp).getTime() : 0)
+          .reduce((max, ts) => Math.max(max, ts), 0);
+        
+        if (latestCachedTimestamp > 0) {
+          const latestCachedTime = new Date(latestCachedTimestamp);
+          // Check if a new hourly candle should be available
+          const needsUpdate = hasNewCandleAvailable(latestCachedTime, '1h');
+          
+          if (!needsUpdate) {
+            const cacheAge = Date.now() - cached.timestamp;
+            console.log(`[Cache] Using cached RSI data - latest candle: ${latestCachedTime.toISOString()}, cache age: ${Math.round(cacheAge / 1000)}s, new candle not yet available`);
+            return cached.data;
+          } else {
+            console.log(`[Cache] New hourly candle available - latest cached: ${latestCachedTime.toISOString()}, fetching fresh data...`);
+          }
+        } else {
+          // If we can't determine latest timestamp, use time-based cache (5 minutes)
+          const cacheAge = Date.now() - cached.timestamp;
+          if (cacheAge < 5 * 60 * 1000) {
+            console.log(`[Cache] Using cached RSI data (age: ${Math.round(cacheAge / 1000)}s)`);
+            return cached.data;
+          }
+        }
+      }
+    }
+    
+    // Fetch fresh data with rate limiting
+    console.log(`[Cache] Fetching fresh RSI data from API...`);
+    const results = [];
+    
+    // Process symbols sequentially with delay to respect rate limits
+    for (const symbol of symbols) {
+      try {
+        const result = await fetchRSIFromBinance(symbol, period, maPeriod);
+        results.push(result);
+        
+        // Add delay between requests to avoid rate limiting
+        // Only delay if not the last symbol
+        if (symbol !== symbols[symbols.length - 1]) {
+          await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
+        }
+      } catch (error) {
+        console.error(`Error fetching RSI for ${symbol}:`, error);
+        results.push(null);
+        
+        // Add delay even on error to maintain rate limit
+        if (symbol !== symbols[symbols.length - 1]) {
+          await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_DELAY_MS));
+        }
+      }
+    }
     
     // Filter out null results (failed requests)
-    return results.filter(result => result !== null);
+    const filteredResults = results.filter(result => result !== null);
+    
+    // Cache the results with 2 hour expiry (ensures we have valid cache for next hour even if no new candle)
+    CacheUtils.set(cacheKey, filteredResults, 2 * 60 * 60 * 1000);
+    
+    return filteredResults;
   } catch (error) {
     console.error('Error fetching multiple RSI:', error);
     throw error;
@@ -402,14 +619,17 @@ export const fetchMultipleRSI = async (symbols = ['BTC/USDT', 'BNB/USDT', 'ETH/U
  * @param {string} symbol - Trading pair (e.g., 'BTC/USDT')
  * @param {number} days - Number of days to look back (default: 7)
  * @param {number} period - RSI period (default: 14)
+ * @param {number} sinceTimestamp - Only fetch data after this timestamp (for incremental updates)
  * @returns {Promise<Array>} Array of RSI data points with timestamps
  */
-export const fetchHistoricalRSI = async (symbol, days = 7, period = 14) => {
+export const fetchHistoricalRSI = async (symbol, days = 7, period = 14, sinceTimestamp = null) => {
   try {
-    const hours = days * 24; // Total hours to fetch (168 for 7 days)
+    const now = Date.now();
+    const cutoffTime = now - (days * 24 * 60 * 60 * 1000);
     
-    // Fetch enough data: 7 days + warmup period for RSI calculation
-    // Need at least period candles before first valid RSI
+    // If sinceTimestamp is provided, we only need to fetch data after it
+    // But we still need enough data for RSI calculation, so fetch a bit more
+    const hours = days * 24; // Total hours to fetch (168 for 7 days)
     const fetchLimit = hours + period + 50;
     
     // Fetch klines - EXACTLY same method as fetchRSIFromBinance
@@ -433,10 +653,6 @@ export const fetchHistoricalRSI = async (symbol, days = 7, period = 14) => {
     // This uses Wilder's smoothing, same as Current RSI Analysis
     const rsiValues = calculateRSI(prices, period);
     
-    // Calculate timestamp threshold (7 days ago from now in UTC)
-    const now = Date.now();
-    const cutoffTime = now - (days * 24 * 60 * 60 * 1000);
-    
     // Build historical RSI array
     // IMPORTANT: rsiValues[i] corresponds to formattedData[i].closeTime (when candle closed)
     // Start from index 'period' since that's when first valid RSI appears
@@ -446,14 +662,17 @@ export const fetchHistoricalRSI = async (symbol, days = 7, period = 14) => {
       const candleCloseTime = formattedData[i].closeTime.getTime();
       const rsi = rsiValues[i];
       
-      // Include only: (1) within last 7 days, (2) has valid RSI
+      // Include only: (1) within last 7 days, (2) has valid RSI, (3) after sinceTimestamp if provided
       if (candleCloseTime >= cutoffTime && rsi !== null && rsi !== undefined && !isNaN(rsi) && rsi >= 0 && rsi <= 100) {
-        historicalRSI.push({
-          timestamp: formattedData[i].closeTime, // Use closeTime for accuracy
-          price: formattedData[i].close,
-          rsi: Number(rsi.toFixed(2)), // Round to 2 decimals for consistency
-          symbol: symbol
-        });
+        // If sinceTimestamp is provided, only include data after it
+        if (!sinceTimestamp || candleCloseTime > sinceTimestamp) {
+          historicalRSI.push({
+            timestamp: formattedData[i].closeTime, // Use closeTime for accuracy
+            price: formattedData[i].close,
+            rsi: Number(rsi.toFixed(2)), // Round to 2 decimals for consistency
+            symbol: symbol
+          });
+        }
       }
     }
     
@@ -465,20 +684,53 @@ export const fetchHistoricalRSI = async (symbol, days = 7, period = 14) => {
 };
 
 /**
- * Fetch oversold history (RSI <= 30) for multiple symbols in the last N days
+ * Fetch oversold history (RSI <= 30) for multiple symbols in the last N days (with caching)
  * @param {Array<string>} symbols - Array of trading pairs
  * @param {number} days - Number of days to look back (default: 7)
  * @param {number} rsiThreshold - RSI threshold (default: 30)
+ * @param {boolean} forceRefresh - Force refresh from API (skip cache)
  * @returns {Promise<Array>} Array of oversold events
  */
-export const fetchOversoldHistory = async (symbols = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'HYPE/USDT', 'ENA/USDT'], days = 7, rsiThreshold = 30) => {
+export const fetchOversoldHistory = async (symbols = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'ENA/USDT'], days = 7, rsiThreshold = 30, forceRefresh = false) => {
   try {
+    const cacheKey = `oversold_${symbols.join('_')}_${days}_${rsiThreshold}`;
+    
+    // Always check cache to find last timestamp (even on force refresh)
+    // This allows incremental fetching even when user clicks refresh
+    let cachedData = null;
+    let lastTimestamp = null;
+    
+    const cached = CacheUtils.get(cacheKey);
+    if (cached && cached.data && Array.isArray(cached.data) && cached.data.length > 0) {
+      cachedData = cached.data;
+      // Find the latest timestamp in cached data
+      const maxTimestamp = Math.max(...cachedData.map(item => new Date(item.timestamp).getTime()));
+      const latestCachedTime = new Date(maxTimestamp);
+      
+      // Check if a new hourly candle should be available (since oversold uses 1h candles)
+      const needsUpdate = hasNewCandleAvailable(latestCachedTime, '1h');
+      
+      if (!forceRefresh && !needsUpdate) {
+        // No new candle available, return cached data
+        console.log(`[Cache] Using cached oversold history - latest candle: ${latestCachedTime.toISOString()}, new candle not yet available`);
+        return cachedData;
+      }
+      
+      // Subtract 1 minute to ensure we get complete data
+      lastTimestamp = maxTimestamp - (60 * 1000);
+      if (forceRefresh) {
+        console.log(`[Cache] Force refresh: Found ${cachedData.length} cached oversold events, fetching new data since ${new Date(lastTimestamp).toISOString()}`);
+      } else {
+        console.log(`[Cache] New hourly candle available - latest cached: ${latestCachedTime.toISOString()}, fetching new oversold events since ${new Date(lastTimestamp).toISOString()}`);
+      }
+    }
+    
     const allEvents = [];
     
-    // Fetch historical RSI for each symbol
+    // Fetch historical RSI for each symbol (only new data since last cache if cached exists)
     for (const symbol of symbols) {
       try {
-        const historicalRSI = await fetchHistoricalRSI(symbol, days, 14);
+        const historicalRSI = await fetchHistoricalRSI(symbol, days, 14, lastTimestamp);
         
         // Filter for RSI <= threshold
         const oversoldEvents = historicalRSI
@@ -500,10 +752,44 @@ export const fetchOversoldHistory = async (symbols = ['BTC/USDT', 'BNB/USDT', 'E
       }
     }
     
-    // Sort by timestamp (most recent first)
-    allEvents.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    // Merge cached data with new events (only if not force refresh or if we have new events)
+    let mergedEvents;
+    if (cachedData && !forceRefresh) {
+      mergedEvents = [...cachedData, ...allEvents];
+    } else if (cachedData && forceRefresh && allEvents.length > 0) {
+      // On force refresh, only merge if we have new events
+      mergedEvents = [...cachedData, ...allEvents];
+    } else {
+      mergedEvents = allEvents;
+    }
     
-    return allEvents;
+    // Sort by timestamp (most recent first) and remove duplicates
+    mergedEvents.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    
+    // Remove duplicates (same symbol, same timestamp)
+    const uniqueEvents = [];
+    const seen = new Set();
+    for (const event of mergedEvents) {
+      const key = `${event.symbol}_${new Date(event.timestamp).getTime()}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueEvents.push(event);
+      }
+    }
+    
+    // Cache the merged results (1 hour expiry)
+    CacheUtils.set(cacheKey, uniqueEvents, 60 * 60 * 1000);
+    
+    if (cachedData && allEvents.length > 0) {
+      console.log(`[Cache] Merged ${allEvents.length} new events with ${cachedData.length} cached events = ${uniqueEvents.length} total`);
+    } else if (cachedData) {
+      console.log(`[Cache] No new events found, using ${cachedData.length} cached events`);
+      return cachedData; // Return cached if no new data
+    } else {
+      console.log(`[Cache] Cached ${uniqueEvents.length} oversold events`);
+    }
+    
+    return uniqueEvents;
   } catch (error) {
     console.error('Error fetching oversold history:', error);
     throw error;
@@ -908,9 +1194,10 @@ export const formatNYTime = (timestamp) => {
  * Detect breakout and re-entry trading signals for a symbol
  * @param {string} symbol - Trading pair (e.g., 'BTC/USDT')
  * @param {number} days - Number of days to analyze (default: 3)
- * @returns {Promise<Array>} Array of trading signals
+ * @param {Date} sinceDate - Only detect signals after this date (for incremental updates)
+ * @returns {Promise<Object>} Object with { signals, breakoutsWithoutReentry }
  */
-export const detectBreakoutSignals = async (symbol, days = 3) => {
+export const detectBreakoutSignals = async (symbol, days = 3, sinceDate = null) => {
   try {
     // Calculate the date range: last N days from today 11:00 UTC+7 to (N-1) days ago 11:00 UTC+7
     // Get today's date in UTC+7 (Bangkok timezone) 
@@ -939,10 +1226,19 @@ export const detectBreakoutSignals = async (symbol, days = 3) => {
     const startDate11Bangkok = new Date(today11Bangkok);
     startDate11Bangkok.setDate(startDate11Bangkok.getDate() - (days - 1));
     
+    // If sinceDate is provided, use it as the start time (for incremental updates)
+    // Otherwise, use the calculated start time
+    let startTime;
+    if (sinceDate) {
+      startTime = sinceDate.getTime();
+      console.log(`[${symbol}] Using sinceDate for incremental fetch: ${sinceDate.toISOString()}`);
+    } else {
+      startTime = startDate11Bangkok.getTime(); // (days-1) days ago 11:00 UTC+7 in UTC milliseconds
+    }
+    
     // Convert to UTC timestamps for comparison with Binance data (which is in UTC)
     // Binance timestamps are UTC, so we compare directly
     const endTime = today11Bangkok.getTime(); // Today 11:00 UTC+7 in UTC milliseconds
-    const startTime = startDate11Bangkok.getTime(); // (days-1) days ago 11:00 UTC+7 in UTC milliseconds
     
     // For filtering: we want ranges that close between startTime and endTime
     // The 4H range closes at 15:00 UTC+7, so we check if closeTime is within our date range
@@ -955,10 +1251,11 @@ export const detectBreakoutSignals = async (symbol, days = 3) => {
     const klines = await fetch4HourKlines(symbol, Math.min(limit, 500));
     
     if (!klines || klines.length === 0) {
-      return [];
+      return { signals: [], breakoutsWithoutReentry: [] };
     }
     
     const signals = [];
+    const breakoutsWithoutReentry = []; // Track breakouts that haven't had re-entry yet
     
     // Group candles by UTC+7 date and find the 11:00-15:00 candle for each day
     const dailyRanges = new Map(); // date -> { high, low, openTime, closeTime, candle }
@@ -1370,6 +1667,9 @@ export const detectBreakoutSignals = async (symbol, days = 3) => {
           // Find all candles from first breakout to re-entry (inclusive)
           const candlesDuringBreakout = candlesAfterRange.slice(firstBreakoutIndex, i + 1);
           
+          // Calculate maximum allowed risk (1% of entry price)
+          const maxAllowedRisk = currentEntryPrice * 0.01; // 1% of entry price
+          
           if (currentDirection === 'long') {
             // For LONG: Find the lowest price (low) during the breakout period
             let lowestPrice = candlesDuringBreakout[0].low;
@@ -1378,9 +1678,18 @@ export const detectBreakoutSignals = async (symbol, days = 3) => {
                 lowestPrice = breakoutCandle.low;
               }
             }
-            currentStopLoss = lowestPrice;
-            currentRisk = currentEntryPrice - currentStopLoss;
-            console.log(`[${symbol}] LONG: Lowest price during breakout period (from first breakout to re-entry): ${currentStopLoss.toFixed(4)}`);
+            const calculatedRisk = currentEntryPrice - lowestPrice;
+            
+            // Cap risk at 1% if calculated risk exceeds it
+            if (calculatedRisk > maxAllowedRisk) {
+              currentRisk = maxAllowedRisk;
+              currentStopLoss = currentEntryPrice - currentRisk; // SL = Entry - 1% of Entry
+              console.log(`[${symbol}] LONG: Calculated risk ${(calculatedRisk / currentEntryPrice * 100).toFixed(2)}% exceeds 1%, capping at 1%. SL=${currentStopLoss.toFixed(4)}`);
+            } else {
+              currentRisk = calculatedRisk;
+              currentStopLoss = lowestPrice;
+              console.log(`[${symbol}] LONG: Lowest price during breakout period (from first breakout to re-entry): ${currentStopLoss.toFixed(4)}`);
+            }
           } else {
             // For SHORT: Find the highest price (high) during the breakout period
             let highestPrice = candlesDuringBreakout[0].high;
@@ -1389,18 +1698,30 @@ export const detectBreakoutSignals = async (symbol, days = 3) => {
                 highestPrice = breakoutCandle.high;
               }
             }
-            currentStopLoss = highestPrice;
-            currentRisk = currentStopLoss - currentEntryPrice;
-            console.log(`[${symbol}] SHORT: Highest price during breakout period (from first breakout to re-entry): ${currentStopLoss.toFixed(4)}`);
+            const calculatedRisk = highestPrice - currentEntryPrice;
+            
+            // Cap risk at 1% if calculated risk exceeds it
+            if (calculatedRisk > maxAllowedRisk) {
+              currentRisk = maxAllowedRisk;
+              currentStopLoss = currentEntryPrice + currentRisk; // SL = Entry + 1% of Entry
+              console.log(`[${symbol}] SHORT: Calculated risk ${(calculatedRisk / currentEntryPrice * 100).toFixed(2)}% exceeds 1%, capping at 1%. SL=${currentStopLoss.toFixed(4)}`);
+            } else {
+              currentRisk = calculatedRisk;
+              currentStopLoss = highestPrice;
+              console.log(`[${symbol}] SHORT: Highest price during breakout period (from first breakout to re-entry): ${currentStopLoss.toFixed(4)}`);
+            }
           }
           
-          // Calculate TP based on 1:2 risk ratio
+          // Calculate TP based on 1:2 risk ratio (TP = Entry ± 2% of Entry)
+          // Since risk is capped at 1%, TP will be 2% (1% * 2)
           let currentTakeProfit = 0;
           if (currentDirection === 'long') {
-            currentTakeProfit = currentEntryPrice + (currentRisk * 2);
+            currentTakeProfit = currentEntryPrice + (currentRisk * 2); // TP = Entry + 2%
           } else {
-            currentTakeProfit = currentEntryPrice - (currentRisk * 2);
+            currentTakeProfit = currentEntryPrice - (currentRisk * 2); // TP = Entry - 2%
           }
+          
+          console.log(`[${symbol}] Entry: ${currentEntryPrice.toFixed(4)}, SL: ${currentStopLoss.toFixed(4)} (${(currentRisk / currentEntryPrice * 100).toFixed(2)}%), TP: ${currentTakeProfit.toFixed(4)} (${(currentRisk * 2 / currentEntryPrice * 100).toFixed(2)}%)`);
           
           // Store this valid pair (first breakout with re-entry)
           // Result will be determined as we iterate through subsequent candles
@@ -1441,6 +1762,45 @@ export const detectBreakoutSignals = async (symbol, days = 3) => {
         validBreakoutReentryPairs.forEach((pair, idx) => {
           console.log(`  [${idx + 1}] Breakout: ${formatNYTimeInternal(pair.breakoutTime)} (${pair.breakoutPrice.toFixed(4)}) → Re-entry: ${formatNYTimeInternal(pair.reentryTime)} (${pair.entryPrice.toFixed(4)}) [${pair.breakoutDirection.toUpperCase()}]`);
         });
+      }
+      
+      // Track breakouts without re-entry: check if firstBreakout is still waiting after loop ends
+      if (firstBreakoutIndex !== null && firstBreakoutTime !== null) {
+        // Check if this breakout already has a re-entry in validBreakoutReentryPairs
+        const hasReentry = validBreakoutReentryPairs.some(pair => 
+          Math.abs(pair.breakoutTime.getTime() - firstBreakoutTime.getTime()) < 60000
+        );
+        
+        if (!hasReentry) {
+          // This breakout never got a re-entry, add it to breakoutsWithoutReentry
+          const breakoutWithoutReentry = {
+            symbol: symbol.replace('/USDT', ''),
+            rangeDate: dateKey,
+            rangeHigh,
+            rangeLow,
+            rangeCloseTime,
+            breakoutTime: firstBreakoutTime,
+            breakoutPrice: firstBreakoutPrice,
+            breakoutDirection: firstBreakoutDirection === 'long' ? 'below' : 'above', // Direction of breakout (above/below)
+            isAbove: firstBreakoutPrice > rangeHigh,
+            isBelow: firstBreakoutPrice < rangeLow
+          };
+          
+          // Get current price to show how far from range
+          try {
+            const currentPriceData = await getBinancePrice(symbol);
+            if (currentPriceData && currentPriceData.price) {
+              breakoutWithoutReentry.currentPrice = parseFloat(currentPriceData.price);
+            }
+          } catch (err) {
+            // If price fetch fails, continue without current price
+            console.warn(`[${symbol}] Could not fetch current price for breakout without re-entry`);
+          }
+          
+          // Store in a separate array (will be returned separately)
+          breakoutsWithoutReentry.push(breakoutWithoutReentry);
+          console.log(`[${symbol}] 🔶 Breakout without re-entry detected: ${formatNYTimeInternal(firstBreakoutTime)} (${firstBreakoutPrice.toFixed(4)})`);
+        }
       }
       
       // Add ALL valid signals, not just one per day
@@ -1484,6 +1844,33 @@ export const detectBreakoutSignals = async (symbol, days = 3) => {
           console.log(`[${symbol}] No breakouts detected for ${dateKey}, rangeHigh=${rangeHigh.toFixed(4)}, rangeLow=${rangeLow.toFixed(4)}`);
         } else if (validBreakoutReentryPairs.length === 0) {
           console.log(`[${symbol}] ${potentialBreakouts.length} breakouts found but no re-entries for ${dateKey}`);
+          
+          // Also check if firstBreakout exists and hasn't been added yet
+          if (firstBreakoutIndex !== null && firstBreakoutTime !== null) {
+            const breakoutWithoutReentry = {
+              symbol: symbol.replace('/USDT', ''),
+              rangeDate: dateKey,
+              rangeHigh,
+              rangeLow,
+              rangeCloseTime,
+              breakoutTime: firstBreakoutTime,
+              breakoutPrice: firstBreakoutPrice,
+              breakoutDirection: firstBreakoutDirection === 'long' ? 'below' : 'above',
+              isAbove: firstBreakoutPrice > rangeHigh,
+              isBelow: firstBreakoutPrice < rangeLow
+            };
+            
+            try {
+              const currentPriceData = await getBinancePrice(symbol);
+              if (currentPriceData && currentPriceData.price) {
+                breakoutWithoutReentry.currentPrice = parseFloat(currentPriceData.price);
+              }
+            } catch (err) {
+              console.warn(`[${symbol}] Could not fetch current price for breakout without re-entry`);
+            }
+            
+            breakoutsWithoutReentry.push(breakoutWithoutReentry);
+          }
         }
       }
     }
@@ -1559,7 +1946,11 @@ export const detectBreakoutSignals = async (symbol, days = 3) => {
       console.log(`[${symbol}] After checking subsequent days: ${updatedSignals} positions closed, ${stillPending} still pending`);
     }
     
-    return signals;
+    // Return both signals and breakouts without re-entry
+    return {
+      signals: signals,
+      breakoutsWithoutReentry: breakoutsWithoutReentry
+    };
   } catch (error) {
     console.error(`Error detecting breakout signals for ${symbol}:`, error);
     throw error;
@@ -1568,23 +1959,64 @@ export const detectBreakoutSignals = async (symbol, days = 3) => {
 
 
 /**
- * Fetch breakout signals for multiple symbols
+ * Fetch breakout signals for multiple symbols (with caching)
  * @param {Array<string>} symbols - Array of trading pairs
  * @param {number} days - Number of days to analyze (default: 7)
- * @returns {Promise<Array>} Array of trading signals
+ * @param {boolean} forceRefresh - Force refresh from API (skip cache)
+ * @returns {Promise<Array>} Array of trading signals (only signals with re-entry)
  */
 export const fetchMultipleBreakoutSignals = async (
-  symbols = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'HYPE/USDT', 'ENA/USDT'],
-  days = 30
+  symbols = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'ENA/USDT'],
+  days = 30,
+  forceRefresh = false
 ) => {
   // Ensure symbols match the same order as other features
-  // BTC BNB ETH XRP SOL SUI DOGE ADA ASTER PEPE HYPE ENA
+  // BTC BNB ETH XRP SOL SUI DOGE ADA ASTER PEPE ENA
   try {
+    const cacheKey = `breakout_signals_${symbols.join('_')}_${days}`;
+    
+    // Always check cache to find last timestamp (even on force refresh)
+    // This allows incremental fetching even when user clicks refresh
+    let cachedData = null;
+    let lastReentryTime = null;
+    
+    const cached = CacheUtils.get(cacheKey);
+    if (cached && cached.data && Array.isArray(cached.data) && cached.data.length > 0) {
+      cachedData = cached.data;
+      // Find the latest re-entry time in cached data
+      const maxTimestamp = Math.max(...cachedData.map(signal => {
+        const reentryTime = signal.reentryTime instanceof Date ? signal.reentryTime : new Date(signal.reentryTime);
+        return reentryTime.getTime();
+      }));
+      const latestCachedTime = new Date(maxTimestamp);
+      
+      // Check if a new 5-minute candle should be available (since breakouts use 5m candles)
+      const needsUpdate = hasNewCandleAvailable(latestCachedTime, '5m');
+      
+      if (!forceRefresh && !needsUpdate) {
+        // No new candle available, return cached data
+        console.log(`[Cache] Using cached breakout signals - latest reentry: ${latestCachedTime.toISOString()}, new 5m candle not yet available`);
+        return cachedData;
+      }
+      
+      // Subtract 1 minute to ensure we get complete data
+      lastReentryTime = maxTimestamp - (60 * 1000);
+      if (forceRefresh) {
+        console.log(`[Cache] Force refresh: Found ${cachedData.length} cached breakout signals, fetching new signals since ${new Date(lastReentryTime).toISOString()}`);
+      } else {
+        console.log(`[Cache] New 5m candle available - latest reentry: ${latestCachedTime.toISOString()}, fetching new signals since ${new Date(lastReentryTime).toISOString()}`);
+      }
+    }
+    
     const allSignals = [];
     
+    // Fetch signals for each symbol (only new ones since last cache if cached exists)
     for (const symbol of symbols) {
       try {
-        const signals = await detectBreakoutSignals(symbol, days);
+        const sinceDate = lastReentryTime ? new Date(lastReentryTime) : null;
+        const result = await detectBreakoutSignals(symbol, days, sinceDate);
+        // result is now an object with { signals, breakoutsWithoutReentry }
+        const signals = Array.isArray(result) ? result : (result.signals || []);
         allSignals.push(...signals);
         
         // Small delay to avoid rate limiting
@@ -1595,14 +2027,221 @@ export const fetchMultipleBreakoutSignals = async (
       }
     }
     
-    // Sort by re-entry time (most recent first)
-    allSignals.sort((a, b) => 
-      new Date(b.reentryTime).getTime() - new Date(a.reentryTime).getTime()
+    // Merge cached data with new signals (only if not force refresh or if we have new signals)
+    let mergedSignals;
+    if (cachedData && !forceRefresh) {
+      mergedSignals = [...cachedData, ...allSignals];
+    } else if (cachedData && forceRefresh && allSignals.length > 0) {
+      // On force refresh, only merge if we have new signals
+      mergedSignals = [...cachedData, ...allSignals];
+    } else {
+      mergedSignals = allSignals;
+    }
+    
+    // Normalize Date objects first (convert strings to Date objects if needed)
+    const normalizedSignalsForSort = mergedSignals.map(signal => ({
+      ...signal,
+      reentryTime: signal.reentryTime instanceof Date ? signal.reentryTime : new Date(signal.reentryTime),
+      breakoutTime: signal.breakoutTime instanceof Date ? signal.breakoutTime : new Date(signal.breakoutTime)
+    }));
+    
+    // Sort by re-entry time (most recent first - descending order)
+    normalizedSignalsForSort.sort((a, b) => 
+      b.reentryTime.getTime() - a.reentryTime.getTime()
     );
     
-    return allSignals;
+    // Use normalized signals for further processing
+    mergedSignals = normalizedSignalsForSort;
+    
+    // Remove duplicates (same symbol, same re-entry time)
+    const uniqueSignals = [];
+    const seen = new Set();
+    for (const signal of mergedSignals) {
+      const key = `${signal.symbol}_${signal.reentryTime.getTime()}_${signal.breakoutTime?.getTime() || ''}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueSignals.push(signal);
+      }
+    }
+    
+    // Cache the merged results (1 hour expiry)
+    CacheUtils.set(cacheKey, uniqueSignals, 60 * 60 * 1000);
+    
+    if (cachedData && allSignals.length > 0) {
+      console.log(`[Cache] Merged ${allSignals.length} new signals with ${cachedData.length} cached signals = ${uniqueSignals.length} total`);
+    } else if (cachedData && allSignals.length === 0) {
+      // No new signals found, but we already checked if new candle is available
+      // This means we fetched but found no new signals, return cached data
+      console.log(`[Cache] No new signals found after checking, using ${cachedData.length} cached signals`);
+      return cachedData;
+    } else if (!cachedData && allSignals.length === 0) {
+      console.log(`[Cache] No cached data and no new signals found`);
+    } else {
+      console.log(`[Cache] Cached ${uniqueSignals.length} breakout signals`);
+    }
+    
+    return uniqueSignals;
   } catch (error) {
     console.error('Error fetching multiple breakout signals:', error);
+    throw error;
+  }
+};
+
+/**
+ * Fetch breakouts without re-entry for multiple symbols (with caching)
+ * @param {Array<string>} symbols - Array of trading pairs
+ * @param {number} days - Number of days to analyze (default: 3)
+ * @param {boolean} forceRefresh - Force refresh from API (skip cache)
+ * @returns {Promise<Array>} Array of breakouts without re-entry
+ */
+export const fetchBreakoutsWithoutReentry = async (
+  symbols = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'ENA/USDT'],
+  days = 3,
+  forceRefresh = false
+) => {
+  try {
+    const cacheKey = `breakouts_without_reentry_${symbols.join('_')}_${days}`;
+    
+    // Always check cache to find last timestamp (even on force refresh)
+    // This allows incremental fetching even when user clicks refresh
+    let cachedData = null;
+    let lastBreakoutTime = null;
+    
+    const cached = CacheUtils.get(cacheKey);
+    if (cached && cached.data && Array.isArray(cached.data) && cached.data.length > 0) {
+      cachedData = cached.data;
+      // Find the latest breakout time in cached data
+      const maxTimestamp = Math.max(...cachedData.map(breakout => {
+        const breakoutTime = breakout.breakoutTime instanceof Date ? breakout.breakoutTime : new Date(breakout.breakoutTime);
+        return breakoutTime.getTime();
+      }));
+      const latestCachedTime = new Date(maxTimestamp);
+      
+      // Check if a new 5-minute candle should be available (since breakouts use 5m candles)
+      const needsUpdate = hasNewCandleAvailable(latestCachedTime, '5m');
+      
+      if (!forceRefresh && !needsUpdate) {
+        // No new candle available, return cached data (after filtering for last 24 hours)
+        // Still need to filter to last 24 hours even when using cache
+        const now = new Date();
+        const last24Hours = now.getTime() - (24 * 60 * 60 * 1000);
+        const breakoutsLast24Hours = cachedData.filter(breakout => {
+          const breakoutTime = breakout.breakoutTime instanceof Date ? breakout.breakoutTime : new Date(breakout.breakoutTime);
+          return breakoutTime.getTime() >= last24Hours;
+        });
+        
+        // Normalize dates and sort
+        const normalizedBreakouts = breakoutsLast24Hours.map(breakout => ({
+          ...breakout,
+          breakoutTime: breakout.breakoutTime instanceof Date ? breakout.breakoutTime : new Date(breakout.breakoutTime)
+        }));
+        normalizedBreakouts.sort((a, b) => b.breakoutTime.getTime() - a.breakoutTime.getTime());
+        
+        console.log(`[Cache] Using cached breakouts without re-entry - latest breakout: ${latestCachedTime.toISOString()}, new 5m candle not yet available, showing ${normalizedBreakouts.length} from last 24h`);
+        return normalizedBreakouts;
+      }
+      
+      // Subtract 1 minute to ensure we get complete data
+      lastBreakoutTime = maxTimestamp - (60 * 1000);
+      if (forceRefresh) {
+        console.log(`[Cache] Force refresh: Found ${cachedData.length} cached breakouts without re-entry, fetching new breakouts since ${new Date(lastBreakoutTime).toISOString()}`);
+      } else {
+        console.log(`[Cache] New 5m candle available - latest breakout: ${latestCachedTime.toISOString()}, fetching new breakouts since ${new Date(lastBreakoutTime).toISOString()}`);
+      }
+    }
+    
+    const allBreakouts = [];
+    
+    // Fetch breakouts for each symbol (only new ones since last cache if cached exists)
+    for (const symbol of symbols) {
+      try {
+        const sinceDate = lastBreakoutTime ? new Date(lastBreakoutTime) : null;
+        const result = await detectBreakoutSignals(symbol, days, sinceDate);
+        // result is now an object with { signals, breakoutsWithoutReentry }
+        const breakouts = Array.isArray(result) ? [] : (result.breakoutsWithoutReentry || []);
+        allBreakouts.push(...breakouts);
+        
+        // Small delay to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 300));
+      } catch (error) {
+        console.error(`Error fetching breakouts without re-entry for ${symbol}:`, error);
+        // Continue with other symbols even if one fails
+      }
+    }
+    
+    // Merge cached data with new breakouts (only if not force refresh or if we have new breakouts)
+    let mergedBreakouts;
+    if (cachedData && !forceRefresh) {
+      mergedBreakouts = [...cachedData, ...allBreakouts];
+    } else if (cachedData && forceRefresh && allBreakouts.length > 0) {
+      // On force refresh, only merge if we have new breakouts
+      mergedBreakouts = [...cachedData, ...allBreakouts];
+    } else {
+      mergedBreakouts = allBreakouts;
+    }
+    
+    // Normalize Date objects first (convert strings to Date objects if needed)
+    const normalizedBreakouts = mergedBreakouts.map(breakout => ({
+      ...breakout,
+      breakoutTime: breakout.breakoutTime instanceof Date ? breakout.breakoutTime : new Date(breakout.breakoutTime)
+    }));
+    
+    // Filter to last 24 hours only
+    const now = new Date();
+    const last24Hours = now.getTime() - (24 * 60 * 60 * 1000); // 24 hours ago
+    const breakoutsLast24Hours = normalizedBreakouts.filter(breakout => 
+      breakout.breakoutTime.getTime() >= last24Hours
+    );
+    
+    // Sort by breakout time (most recent first - descending order)
+    breakoutsLast24Hours.sort((a, b) => 
+      b.breakoutTime.getTime() - a.breakoutTime.getTime()
+    );
+    
+    // Remove duplicates (same symbol, same breakout time)
+    const uniqueBreakouts = [];
+    const seen = new Set();
+    for (const breakout of breakoutsLast24Hours) {
+      const key = `${breakout.symbol}_${breakout.breakoutTime.getTime()}_${breakout.rangeDate}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        uniqueBreakouts.push(breakout);
+      }
+    }
+    
+    // Cache the merged results (1 hour expiry)
+    CacheUtils.set(cacheKey, uniqueBreakouts, 60 * 60 * 1000);
+    
+    if (cachedData && allBreakouts.length > 0) {
+      console.log(`[Cache] Merged ${allBreakouts.length} new breakouts with ${cachedData.length} cached breakouts = ${uniqueBreakouts.length} total`);
+    } else if (cachedData && allBreakouts.length === 0) {
+      // No new breakouts found, but we already checked if new candle is available
+      // Filter cached data for last 24 hours and return
+      const now = new Date();
+      const last24Hours = now.getTime() - (24 * 60 * 60 * 1000);
+      const breakoutsLast24Hours = cachedData.filter(breakout => {
+        const breakoutTime = breakout.breakoutTime instanceof Date ? breakout.breakoutTime : new Date(breakout.breakoutTime);
+        return breakoutTime.getTime() >= last24Hours;
+      });
+      
+      // Normalize dates and sort
+      const normalizedBreakouts = breakoutsLast24Hours.map(breakout => ({
+        ...breakout,
+        breakoutTime: breakout.breakoutTime instanceof Date ? breakout.breakoutTime : new Date(breakout.breakoutTime)
+      }));
+      normalizedBreakouts.sort((a, b) => b.breakoutTime.getTime() - a.breakoutTime.getTime());
+      
+      console.log(`[Cache] No new breakouts found after checking, using ${normalizedBreakouts.length} cached breakouts from last 24h`);
+      return normalizedBreakouts;
+    } else if (!cachedData && allBreakouts.length === 0) {
+      console.log(`[Cache] No cached data and no new breakouts found`);
+    } else {
+      console.log(`[Cache] Cached ${uniqueBreakouts.length} breakouts without re-entry`);
+    }
+    
+    return uniqueBreakouts;
+  } catch (error) {
+    console.error('Error fetching breakouts without re-entry:', error);
     throw error;
   }
 };
@@ -1624,5 +2263,6 @@ export default {
   fetch4HourKlines,
   formatNYTime,
   detectBreakoutSignals,
-  fetchMultipleBreakoutSignals
+  fetchMultipleBreakoutSignals,
+  fetchBreakoutsWithoutReentry
 };
