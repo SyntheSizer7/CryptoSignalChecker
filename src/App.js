@@ -1,5 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { fetchMultipleRSI, fetchOversoldHistory, fetchMultipleBreakoutSignals, fetchBreakoutsWithoutReentry, formatNYTime } from './binance';
+import { fetchMultipleRSI, fetchOversoldHistory, fetchMultipleBreakoutSignals, formatNYTime } from './binance';
+import { 
+  isNotificationSupported, 
+  requestNotificationPermission, 
+  getNotificationPermission,
+  registerServiceWorker,
+  sendNotification,
+  formatBreakoutNotification
+} from './notificationService';
 import './App.css';
 
 // Helper function to get RSI signal interpretation
@@ -163,6 +171,37 @@ const formatTime = (timestamp) => {
   }
 };
 
+// Get date/time at 11:00 UTC+7 for a given date
+// Takes a date (Date object or date string) and returns Date object at 11:00 UTC+7 on that date
+const getDateAt1100UTC7 = (date) => {
+  if (!date) return null;
+  try {
+    const inputDate = date instanceof Date ? date : new Date(date);
+    
+    // Get the date in UTC+7 (Bangkok timezone) as YYYY-MM-DD
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Bangkok',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    });
+    const dateStr = formatter.format(inputDate); // e.g., '2025-11-01'
+    
+    // Parse the date string and create a date at 11:00 UTC+7
+    // We need to create this in UTC first, then convert
+    // UTC+7 means UTC is 7 hours behind, so 11:00 UTC+7 = 04:00 UTC
+    const [year, month, day] = dateStr.split('-').map(Number);
+    
+    // Create date in UTC at 04:00 (which is 11:00 UTC+7)
+    const dateAt1100 = new Date(Date.UTC(year, month - 1, day, 4, 0, 0));
+    
+    return dateAt1100;
+  } catch (e) {
+    console.error('Error calculating date at 11:00 UTC+7:', e);
+    return null;
+  }
+};
+
 // Format price for display
 const formatPrice = (price) => {
   if (!price || isNaN(price)) return 'N/A';
@@ -178,8 +217,8 @@ const formatPrice = (price) => {
 };
 
 // Shared cryptocurrency list - same across all features
-// Order: BTC BNB ETH XRP SOL SUI DOGE ADA ASTER PEPE ENA
-const DEFAULT_SYMBOLS = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'ENA/USDT'];
+// Order: BTC BNB ETH XRP SOL SUI DOGE ADA ASTER PEPE ENA LINK TAO PUMP
+const DEFAULT_SYMBOLS = ['BTC/USDT', 'BNB/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT', 'SUI/USDT', 'DOGE/USDT', 'ADA/USDT', 'ASTER/USDT', 'PEPE/USDT', 'ENA/USDT', 'LINK/USDT', 'TAO/USDT', 'PUMP/USDT'];
 
 // Cryptocurrency Filter Component
 const CryptoFilter = ({ selectedCryptos, onToggleCrypto, onSelectAll, onDeselectAll }) => {
@@ -327,6 +366,14 @@ const normalizeDates = (data) => {
     if (normalized.reentryTime && !(normalized.reentryTime instanceof Date)) {
       normalized.reentryTime = new Date(normalized.reentryTime);
     }
+    // Normalize closeTime if it exists
+    if (normalized.closeTime && !(normalized.closeTime instanceof Date)) {
+      normalized.closeTime = new Date(normalized.closeTime);
+    }
+    // Normalize rangeCloseTime if it exists
+    if (normalized.rangeCloseTime && !(normalized.rangeCloseTime instanceof Date)) {
+      normalized.rangeCloseTime = new Date(normalized.rangeCloseTime);
+    }
     // Normalize timestamp if it exists
     if (normalized.timestamp && !(normalized.timestamp instanceof Date)) {
       normalized.timestamp = new Date(normalized.timestamp);
@@ -345,232 +392,6 @@ const filterDataByCryptos = (data, selectedCryptos) => {
     const symbol = (item.symbol || '').replace('/USDT', '');
     return selectedCryptos.has(symbol);
   });
-};
-
-// Helper function to calculate distance from range for breakouts
-const calculateDistanceFromRange = (breakout) => {
-  if (!breakout.currentPrice) return null;
-  if (breakout.isAbove) {
-    const distance = ((breakout.currentPrice - breakout.rangeHigh) / breakout.rangeHigh) * 100;
-    return distance;
-  } else {
-    const distance = ((breakout.rangeLow - breakout.currentPrice) / breakout.rangeLow) * 100;
-    return distance;
-  }
-};
-
-// Dashboard Component - Shows actionable items requiring attention
-const Dashboard = ({ 
-  rsiData, 
-  breakoutsWithoutReentryData, 
-  selectedCryptos, 
-  isExpanded, 
-  onToggleExpanded,
-  onExpandRSI,
-  onExpandBreakouts 
-}) => {
-  // Filter RSI data: only RSI < 35
-  const filteredRSI = filterDataByCryptos(rsiData?.data || [], selectedCryptos).filter(item => {
-    const currRSI = item.rsi ?? null;
-    return currRSI !== null && currRSI < 35;
-  });
-
-  // Filter Breakouts Without Re-entry: only distance from range < 1%
-  const filteredBreakouts = filterDataByCryptos(breakoutsWithoutReentryData || [], selectedCryptos).filter(breakout => {
-    const distance = calculateDistanceFromRange(breakout);
-    return distance !== null && Math.abs(distance) < 1;
-  });
-
-  const totalCount = filteredRSI.length + filteredBreakouts.length;
-
-  if (!isExpanded) {
-    return (
-      <div className="dashboard-container" style={{ 
-        marginBottom: '1.5rem',
-        border: '2px solid #4dabf7',
-        borderRadius: '8px',
-        backgroundColor: 'rgba(77, 171, 247, 0.1)'
-      }}>
-        <SectionToggle 
-          isExpanded={isExpanded} 
-          onToggle={onToggleExpanded} 
-          title="▶ Dashboard - Requires Action"
-          count={totalCount}
-        />
-      </div>
-    );
-  }
-
-  return (
-    <div className="dashboard-container" style={{ 
-      marginBottom: '1.5rem',
-      border: '2px solid #4dabf7',
-      borderRadius: '8px',
-      backgroundColor: 'rgba(77, 171, 247, 0.1)',
-      padding: '1rem'
-    }}>
-      <SectionToggle 
-        isExpanded={isExpanded} 
-        onToggle={onToggleExpanded} 
-        title="▶ Dashboard - Requires Action"
-        count={totalCount}
-      />
-      <p style={{ fontSize: '0.75rem', opacity: 0.7, marginTop: '0.5rem', marginBottom: '0.5rem', paddingLeft: '0.5rem' }}>
-        Auto-refreshes every 30 seconds | Shows RSI &lt; 35 and Breakouts with distance &lt; 1%
-      </p>
-
-      {/* Current RSI Analysis Section (RSI < 35) */}
-      <div style={{ marginBottom: '1.5rem' }}>
-        <h4 style={{ 
-          color: '#4dabf7', 
-          marginBottom: '0.5rem',
-          display: 'flex',
-          alignItems: 'center',
-          gap: '0.5rem'
-        }}>
-          <span style={{ cursor: 'pointer' }} onClick={onExpandRSI}>▶</span>
-          Current RSI Analysis (RSI &lt; 35) - {filteredRSI.length} items
-        </h4>
-        {filteredRSI.length === 0 ? (
-          <p style={{ opacity: 0.7, paddingLeft: '1.5rem' }}>No RSI values below 35</p>
-        ) : (
-          <div className="rsi-table-wrapper" style={{ maxHeight: '300px', overflowY: 'auto' }}>
-            <table className="rsi-table">
-              <thead>
-                <tr>
-                  <th>Symbol</th>
-                  <th>Current Time</th>
-                  <th>RSI</th>
-                  <th>Price</th>
-                  <th>Signal</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredRSI.map((item, index) => {
-                  const symbol = item.symbol?.replace('/USDT', '') || 'N/A';
-                  const currRSI = item.rsi ?? null;
-                  const price = item.price ?? null;
-                  const currSignal = currRSI !== null ? getRSISignal(currRSI) : null;
-                  
-                  return (
-                    <tr key={index} className="rsi-row-oversold">
-                      <td><strong>{symbol}</strong></td>
-                      <td>{formatTimestamp(item.timestamp)}</td>
-                      <td>
-                        <span className="rsi-value" style={{ 
-                          color: currSignal?.color || '#fff',
-                          fontWeight: 'bold'
-                        }}>
-                          {currRSI !== null ? currRSI.toFixed(2) : 'N/A'}
-                        </span>
-                      </td>
-                      <td>${price !== null ? price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : 'N/A'}</td>
-                      <td>
-                        {currSignal && (
-                          <span className="signal-badge" style={{ 
-                            backgroundColor: currSignal.bgColor,
-                            color: currSignal.color,
-                            borderColor: currSignal.color
-                          }}>
-                            {currSignal.text}
-                          </span>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-
-      {/* Breakouts Without Re-entry Section (Distance < 1%) */}
-      <div>
-        <h4 style={{ 
-          color: '#4dabf7', 
-          marginBottom: '0.5rem',
-          display: 'flex',
-          alignItems: 'center',
-          gap: '0.5rem'
-        }}>
-          <span style={{ cursor: 'pointer' }} onClick={onExpandBreakouts}>▶</span>
-          Breakouts Without Re-entry (Distance &lt; 1%) - {filteredBreakouts.length} items
-        </h4>
-        {filteredBreakouts.length === 0 ? (
-          <p style={{ opacity: 0.7, paddingLeft: '1.5rem' }}>No breakouts with distance from range less than 1%</p>
-        ) : (
-          <div className="breakout-table-wrapper" style={{ maxHeight: '300px', overflowY: 'auto' }}>
-            <table className="breakout-table">
-              <thead>
-                <tr>
-                  <th>Symbol</th>
-                  <th>Range (High/Low)</th>
-                  <th>Time Breakout</th>
-                  <th>Breakout Price</th>
-                  <th>Direction</th>
-                  <th>Current Price</th>
-                  <th>Distance from Range</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredBreakouts.map((breakout, index) => {
-                  const directionBadge = breakout.isAbove 
-                    ? { text: 'ABOVE', color: '#ff6b6b', bgColor: 'rgba(255, 107, 107, 0.2)' }
-                    : { text: 'BELOW', color: '#6bcf7f', bgColor: 'rgba(107, 207, 127, 0.2)' };
-                  
-                  const distance = calculateDistanceFromRange(breakout);
-                  const distancePercent = distance !== null ? (distance > 0 ? `+${distance.toFixed(2)}%` : `${distance.toFixed(2)}%`) : 'N/A';
-                  
-                  return (
-                    <tr key={index} className="breakout-row pending-row">
-                      <td><strong>{breakout.symbol}</strong></td>
-                      <td>
-                        <div className="range-info">
-                          <span className="range-item">
-                            <strong>High:</strong> ${formatPrice(breakout.rangeHigh)}
-                          </span>
-                          <span className="range-item">
-                            <strong>Low:</strong> ${formatPrice(breakout.rangeLow)}
-                          </span>
-                        </div>
-                      </td>
-                      <td>{formatNYTime(breakout.breakoutTime)}</td>
-                      <td>${formatPrice(breakout.breakoutPrice)}</td>
-                      <td>
-                        <span className="direction-badge" style={{ 
-                          backgroundColor: directionBadge.bgColor,
-                          color: directionBadge.color,
-                          borderColor: directionBadge.color
-                        }}>
-                          {directionBadge.text}
-                        </span>
-                      </td>
-                      <td>
-                        {breakout.currentPrice ? (
-                          <span>${formatPrice(breakout.currentPrice)}</span>
-                        ) : (
-                          <span style={{ opacity: 0.6 }}>N/A</span>
-                        )}
-                      </td>
-                      <td>
-                        <span style={{ 
-                          color: directionBadge.color,
-                          fontWeight: 'bold'
-                        }}>
-                          {distancePercent}
-                        </span>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
-    </div>
-  );
 };
 
 // Section Toggle Component
@@ -617,11 +438,261 @@ const SectionToggle = ({ isExpanded, onToggle, title, count, lastUpdateTime }) =
   );
 };
 
-// RSI Table Component
-const RSITable = ({ data, loading, error, onRefresh, selectedCryptos, isExpanded, onToggleExpanded, lastUpdateTime }) => {
-  // Filter data by selected cryptocurrencies
-  const filteredData = filterDataByCryptos(data, selectedCryptos);
-  const dataCount = filteredData ? filteredData.length : 0;
+// Merged RSI + Breakout Status Table Component
+const MergedRSIBreakoutTable = ({ 
+  rsiData, 
+  rsiLoading, 
+  rsiError, 
+  onRefreshRSI,
+  breakoutData, 
+  breakoutLoading, 
+  breakoutError,
+  onRefreshBreakout,
+  breakoutSignalsData,
+  selectedCryptos, 
+  isExpanded, 
+  onToggleExpanded, 
+  lastUpdateTime 
+}) => {
+  // Filter RSI data by selected cryptocurrencies
+  let filteredRsiData = filterDataByCryptos(rsiData, selectedCryptos);
+  
+  // Ensure all selected cryptocurrencies are shown, even if RSI data is missing
+  // Create a map of existing RSI data by symbol
+  const rsiDataMap = new Map();
+  if (filteredRsiData && Array.isArray(filteredRsiData)) {
+    filteredRsiData.forEach(item => {
+      const symbol = (item.symbol || '').replace('/USDT', '');
+      rsiDataMap.set(symbol.toUpperCase(), item);
+    });
+  }
+  
+  // Ensure all selected cryptos have entries (create placeholder if missing)
+  const allSelectedSymbols = Array.from(selectedCryptos).map(s => s.toUpperCase());
+  const completeRsiData = allSelectedSymbols.map(symbol => {
+    const existing = rsiDataMap.get(symbol);
+    if (existing) {
+      return existing;
+    } else {
+      // Create placeholder entry for missing RSI data
+      return {
+        symbol: `${symbol}/USDT`,
+        rsi: null,
+        previous_rsi: null,
+        timestamp: null,
+        price: null
+      };
+    }
+  });
+  
+  filteredRsiData = completeRsiData;
+  
+  // Helper function to get latest breakout status per symbol
+  // Returns the most recent pending breakout/signal for current status display
+  const getLatestBreakoutStatus = (symbol) => {
+    const symbolUpper = symbol.toUpperCase();
+    
+    // Handle case where breakoutSignalsData might be an object with { signals, breakoutsWithoutReentry }
+    // or an array directly
+    let signalsArray = null;
+    if (breakoutSignalsData) {
+      if (Array.isArray(breakoutSignalsData)) {
+        signalsArray = breakoutSignalsData;
+      } else if (typeof breakoutSignalsData === 'object' && breakoutSignalsData.signals) {
+        signalsArray = breakoutSignalsData.signals;
+      }
+    }
+    
+    // First, check breakout signals (these have reentry) - find latest per symbol
+    // Prioritize pending signals, but include all signals with re-entry time to ensure nothing is missed
+    let latestSignal = null;
+    if (signalsArray && Array.isArray(signalsArray)) {
+      // Get all signals for this symbol that have re-entry time (signals with exit/re-entry)
+      const symbolSignals = signalsArray
+        .filter(s => {
+          // Match symbol (handle both "BNB" and "BNB/USDT" formats)
+          const sSymbol = (s.symbol || '').toUpperCase().replace('/USDT', '');
+          const matchesSymbol = sSymbol === symbolUpper;
+          const hasReentry = s.reentryTime && (s.reentryTime instanceof Date || new Date(s.reentryTime).getTime() > 0);
+          // Prioritize pending, but also check others to see if we're missing something
+          return matchesSymbol && hasReentry;
+        })
+        .sort((a, b) => {
+          const aTime = a.reentryTime instanceof Date ? a.reentryTime.getTime() : new Date(a.reentryTime).getTime();
+          const bTime = b.reentryTime instanceof Date ? b.reentryTime.getTime() : new Date(b.reentryTime).getTime();
+          return bTime - aTime; // Most recent first
+        });
+      
+      // Prioritize pending signals, but if none exist, use the most recent one with re-entry
+      if (symbolSignals.length > 0) {
+        // First try to find a pending signal
+        const pendingSignal = symbolSignals.find(s => s.result === 'pending');
+        if (pendingSignal) {
+          latestSignal = pendingSignal;
+        } else {
+          // If no pending signal, use the most recent one (might be a signal that's not yet marked as pending)
+          // But only if it doesn't have a closeTime (meaning it's still active)
+          const activeSignal = symbolSignals.find(s => !s.closeTime || s.closeTime === null);
+          if (activeSignal) {
+            latestSignal = activeSignal;
+          } else {
+            // Last resort: use most recent signal (even if closed, we'll filter it out later in display logic)
+            latestSignal = symbolSignals[0];
+          }
+        }
+      }
+    }
+    
+    // Then, check breakouts without reentry - find latest per symbol
+    let latestBreakoutWithoutReentry = null;
+    if (breakoutData && Array.isArray(breakoutData)) {
+      const symbolBreakouts = breakoutData
+        .filter(b => {
+          const bSymbol = (b.symbol || '').toUpperCase().replace('/USDT', '');
+          return bSymbol === symbolUpper;
+        })
+        .sort((a, b) => {
+          const aTime = a.breakoutTime instanceof Date ? a.breakoutTime.getTime() : new Date(a.breakoutTime).getTime();
+          const bTime = b.breakoutTime instanceof Date ? b.breakoutTime.getTime() : new Date(b.breakoutTime).getTime();
+          return bTime - aTime; // Most recent first
+        });
+      if (symbolBreakouts.length > 0) {
+        latestBreakoutWithoutReentry = symbolBreakouts[0];
+      }
+    }
+    
+    // Determine which one is more recent
+    if (latestSignal && latestBreakoutWithoutReentry) {
+      const signalTime = latestSignal.reentryTime instanceof Date 
+        ? latestSignal.reentryTime.getTime() 
+        : new Date(latestSignal.reentryTime).getTime();
+      const breakoutTime = latestBreakoutWithoutReentry.breakoutTime instanceof Date 
+        ? latestBreakoutWithoutReentry.breakoutTime.getTime() 
+        : new Date(latestBreakoutWithoutReentry.breakoutTime).getTime();
+      
+      return signalTime > breakoutTime ? latestSignal : latestBreakoutWithoutReentry;
+    } else if (latestSignal) {
+      return latestSignal;
+    } else if (latestBreakoutWithoutReentry) {
+      return latestBreakoutWithoutReentry;
+    }
+    
+    return null;
+  };
+  
+  // Helper function to get latest closed signal (for showing close time)
+  const getLatestClosedSignal = (symbol) => {
+    const symbolUpper = symbol.toUpperCase();
+    
+    // Handle case where breakoutSignalsData might be an object with { signals, breakoutsWithoutReentry }
+    // or an array directly
+    let signalsArray = null;
+    if (breakoutSignalsData) {
+      if (Array.isArray(breakoutSignalsData)) {
+        signalsArray = breakoutSignalsData;
+      } else if (typeof breakoutSignalsData === 'object' && breakoutSignalsData.signals) {
+        signalsArray = breakoutSignalsData.signals;
+      }
+    }
+    
+    if (signalsArray && Array.isArray(signalsArray)) {
+      const closedSignals = signalsArray
+        .filter(s => {
+          const sSymbol = (s.symbol || '').toUpperCase().replace('/USDT', '');
+          return sSymbol === symbolUpper && (s.result === 'win' || s.result === 'loss');
+        })
+        .sort((a, b) => {
+          const aTime = a.closeTime instanceof Date ? a.closeTime.getTime() : (a.closeTime ? new Date(a.closeTime).getTime() : 0);
+          const bTime = b.closeTime instanceof Date ? b.closeTime.getTime() : (b.closeTime ? new Date(b.closeTime).getTime() : 0);
+          return bTime - aTime; // Most recent first
+        });
+      if (closedSignals.length > 0) {
+        return closedSignals[0];
+      }
+    }
+    
+    return null;
+  };
+
+  // Helper function to check if a breakout is from a previous day's 4H timeframe
+  // The 4H timeframe is 11:00-15:00 UTC+7 each day
+  // If the breakout time is before today's 11:00 UTC+7, it should be cleared
+  const isBreakoutFromPreviousDay = (breakoutTime) => {
+    if (!breakoutTime) return false;
+    
+    try {
+      const breakoutDate = breakoutTime instanceof Date ? breakoutTime : new Date(breakoutTime);
+      
+      // Get today's date at 11:00 UTC+7 (start of today's 4H timeframe)
+      const todayAt1100UTC7 = getDateAt1100UTC7(new Date());
+      
+      if (!todayAt1100UTC7) return false;
+      
+      // If breakout time is before today's 11:00 UTC+7, it's from a previous day
+      return breakoutDate.getTime() < todayAt1100UTC7.getTime();
+    } catch (e) {
+      console.error('Error checking if breakout is from previous day:', e);
+      return false;
+    }
+  };
+
+  // Track if we've already reset for today (to ensure reset happens only once per day)
+  const lastResetDateRef = useRef(null);
+  
+  // Helper function to check if current time is after 15:00 UTC+7 (end of 4H timeframe)
+  // After 15:00 UTC+7, all breakout data should be cleared to reset for the next day
+  // Returns true only if we haven't reset for today yet (ensures reset happens only once)
+  const isAfter1500UTC7 = () => {
+    try {
+      const now = new Date();
+      
+      // Get today's date at 15:00 UTC+7 (end of today's 4H timeframe)
+      // UTC+7 means UTC is 7 hours behind, so 15:00 UTC+7 = 08:00 UTC
+      const formatter = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Bangkok',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+      });
+      const dateStr = formatter.format(now); // e.g., '2025-11-01'
+      const [year, month, day] = dateStr.split('-').map(Number);
+      
+      // Create date in UTC at 08:00 (which is 15:00 UTC+7)
+      const todayAt1500UTC7 = new Date(Date.UTC(year, month - 1, day, 8, 0, 0));
+      
+      // Check if current time is after 15:00 UTC+7 today
+      const isAfter1500 = now.getTime() >= todayAt1500UTC7.getTime();
+      
+      // Create consistent date string for comparison
+      const todayDateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      
+      if (isAfter1500) {
+        // Check if we've already reset for today
+        if (lastResetDateRef.current !== todayDateStr) {
+          // First time after 15:00 today, mark as reset
+          console.log(`[RESET 15:00] First reset for today: ${todayDateStr} at ${now.toISOString()}`);
+          lastResetDateRef.current = todayDateStr;
+          return true; // Return true to trigger reset
+        }
+        // Already reset for today, return true to keep showing "-"
+        return true;
+      } else {
+        // Before 15:00, clear reset date if it's from a previous day
+        if (lastResetDateRef.current && lastResetDateRef.current !== todayDateStr) {
+          console.log(`[RESET 15:00] Clearing previous day reset: ${lastResetDateRef.current} -> null (today: ${todayDateStr})`);
+          lastResetDateRef.current = null;
+        }
+        return false;
+      }
+    } catch (e) {
+      console.error('Error checking if current time is after 15:00 UTC+7:', e);
+      return false;
+    }
+  };
+
+  const dataCount = filteredRsiData ? filteredRsiData.length : 0;
+  const loading = rsiLoading || breakoutLoading;
+  const error = rsiError || breakoutError;
 
   if (!isExpanded) {
     return (
@@ -629,7 +700,7 @@ const RSITable = ({ data, loading, error, onRefresh, selectedCryptos, isExpanded
         <SectionToggle 
           isExpanded={isExpanded} 
           onToggle={onToggleExpanded} 
-          title="Current RSI Analysis"
+          title="RSI Analysis & Breakout Status"
           count={loading ? null : dataCount}
           lastUpdateTime={lastUpdateTime}
         />
@@ -637,19 +708,19 @@ const RSITable = ({ data, loading, error, onRefresh, selectedCryptos, isExpanded
     );
   }
 
-  if (loading) {
+  if (loading && (!rsiData || !Array.isArray(rsiData) || rsiData.length === 0)) {
     return (
       <div className="rsi-table-container">
         <SectionToggle 
           isExpanded={isExpanded} 
           onToggle={onToggleExpanded} 
-          title="Current RSI Analysis"
+          title="RSI Analysis & Breakout Status"
           count={null}
           lastUpdateTime={lastUpdateTime}
         />
       <div className="loading-mini">
         <div className="spinner-mini"></div>
-        <span>Fetching RSI data...</span>
+        <span>Fetching data...</span>
         </div>
       </div>
     );
@@ -661,7 +732,7 @@ const RSITable = ({ data, loading, error, onRefresh, selectedCryptos, isExpanded
         <SectionToggle 
           isExpanded={isExpanded} 
           onToggle={onToggleExpanded} 
-          title="Current RSI Analysis"
+          title="RSI Analysis & Breakout Status"
           count={null}
           lastUpdateTime={lastUpdateTime}
         />
@@ -672,19 +743,19 @@ const RSITable = ({ data, loading, error, onRefresh, selectedCryptos, isExpanded
     );
   }
 
-  // Ensure data is an array
-  if (!data || !Array.isArray(data) || data.length === 0) {
+  // Ensure RSI data is an array
+  if (!rsiData || !Array.isArray(rsiData) || rsiData.length === 0) {
     return (
       <div className="rsi-table-container">
         <SectionToggle 
           isExpanded={isExpanded} 
           onToggle={onToggleExpanded} 
-          title="Current RSI Analysis"
+          title="RSI Analysis & Breakout Status"
           count={0}
           lastUpdateTime={lastUpdateTime}
         />
         <p style={{ textAlign: 'center', padding: '2rem', opacity: 0.7 }}>
-          No data available. Click "Refresh" to fetch RSI data.
+          No RSI data available. Click "Refresh" to fetch data.
         </p>
       </div>
     );
@@ -695,57 +766,358 @@ const RSITable = ({ data, loading, error, onRefresh, selectedCryptos, isExpanded
       <SectionToggle 
         isExpanded={isExpanded} 
         onToggle={onToggleExpanded} 
-        title="Current RSI Analysis"
+        title="RSI Analysis & Breakout Status"
         count={dataCount}
         lastUpdateTime={lastUpdateTime}
       />
       <div className="rsi-table-header">
         <div>
-          <p className="rsi-subtitle">1 Hour Timeframe | RSI Period: 14 | Type: Wilder's Smoothing | Timezone: UTC+7</p>
+          <p className="rsi-subtitle">RSI: 1 Hour Timeframe | RSI Period: 14 | Type: Wilder's Smoothing | Breakouts: Latest Status Per Symbol | Timezone: UTC+7</p>
         </div>
-        <button onClick={onRefresh} className="refresh-btn-small" disabled={loading}>
-          {loading ? 'Loading...' : 'Refresh'}
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <button onClick={onRefreshRSI} className="refresh-btn-small" disabled={rsiLoading}>
+            {rsiLoading ? 'Loading...' : 'Refresh RSI'}
+          </button>
+          <button onClick={onRefreshBreakout} className="refresh-btn-small" disabled={breakoutLoading}>
+            {breakoutLoading ? 'Loading...' : 'Refresh Breakout'}
         </button>
+        </div>
       </div>
       <div className="rsi-table-wrapper">
         <table className="rsi-table">
           <thead>
             <tr>
               <th>Symbol</th>
-              <th>Previous Time</th>
-              <th>Current Time</th>
-              <th>Prev RSI</th>
-              <th>Prev MA</th>
-              <th>Curr RSI</th>
-              <th>Curr MA</th>
-              <th>Price</th>
-              <th>Signal</th>
+              <th>RSI</th>
+              <th>Breakout</th>
+              <th>Re-entry</th>
+              <th>Long/Short</th>
+              <th>Close Status</th>
+              <th>Distance from Range</th>
             </tr>
           </thead>
           <tbody>
-            {filteredData.map((item, index) => {
+            {filteredRsiData.map((item, index) => {
               const symbol = item.symbol?.replace('/USDT', '') || 'N/A';
               const prevRSI = item.previous_rsi ?? null;
               const currRSI = item.rsi ?? null;
-              const prevMA = item.previous_rsi_ma ?? null;
-              const currMA = item.rsi_ma ?? null;
-              const price = item.price ?? null;
               
-              const prevSignal = prevRSI !== null ? getRSISignal(prevRSI) : null;
               const currSignal = currRSI !== null ? getRSISignal(currRSI) : null;
               
-              const isOversold = (prevRSI !== null && prevRSI < 35) || (currRSI !== null && currRSI < 35);
+              // Get latest breakout status for this symbol
+              const latestStatus = getLatestBreakoutStatus(symbol);
+              
+              // Get latest closed signal for this symbol (for showing close time)
+              const latestClosedSignal = getLatestClosedSignal(symbol);
+              const closeTime = latestClosedSignal && latestClosedSignal.closeTime 
+                ? (latestClosedSignal.closeTime instanceof Date ? formatNYTime(latestClosedSignal.closeTime) : formatNYTime(new Date(latestClosedSignal.closeTime)))
+                : '-';
+              
+              // Check if current time is after 15:00 UTC+7 (end of 4H timeframe)
+              // Cache the result to avoid multiple calls per render
+              // This ensures reset happens only once per day
+              const shouldReset = isAfter1500UTC7();
+              
+              // Debug logging (temporary) - Enhanced
+              if (symbol === 'BNB' || symbol === 'BTC' || symbol === 'ETH' || symbol === 'ADA') {
+                console.log(`[DEBUG ${symbol}] latestStatus:`, latestStatus ? {
+                  hasReentryTime: !!latestStatus.reentryTime,
+                  hasBreakoutTime: !!latestStatus.breakoutTime,
+                  result: latestStatus.result,
+                  hasCloseTime: !!latestStatus.closeTime,
+                  closeTime: latestStatus.closeTime,
+                  breakoutTime: latestStatus.breakoutTime,
+                  reentryTime: latestStatus.reentryTime,
+                  breakoutDirection: latestStatus.breakoutDirection,
+                  symbol: latestStatus.symbol
+                } : 'null (not found)');
+                console.log(`[DEBUG ${symbol}] breakoutSignalsData type:`, typeof breakoutSignalsData, Array.isArray(breakoutSignalsData));
+                console.log(`[DEBUG ${symbol}] breakoutSignalsData length:`, breakoutSignalsData ? (Array.isArray(breakoutSignalsData) ? breakoutSignalsData.length : (breakoutSignalsData.signals ? breakoutSignalsData.signals.length : 'unknown')) : 0);
+                
+                // Check what signals exist for this symbol
+                let signalsArray = null;
+                if (breakoutSignalsData) {
+                  if (Array.isArray(breakoutSignalsData)) {
+                    signalsArray = breakoutSignalsData;
+                  } else if (typeof breakoutSignalsData === 'object' && breakoutSignalsData.signals) {
+                    signalsArray = breakoutSignalsData.signals;
+                  }
+                }
+                
+                if (signalsArray && Array.isArray(signalsArray)) {
+                  const symbolSignals = signalsArray.filter(s => {
+                    const sSymbol = (s.symbol || '').toUpperCase().replace('/USDT', '');
+                    return sSymbol === symbol.toUpperCase();
+                  });
+                  console.log(`[DEBUG ${symbol}] Found ${symbolSignals.length} signals for symbol:`, symbolSignals.map(s => ({
+                    hasReentryTime: !!s.reentryTime,
+                    result: s.result,
+                    hasCloseTime: !!s.closeTime,
+                    breakoutTime: s.breakoutTime
+                  })));
+                }
+                
+                // Check condition evaluation
+                if (latestStatus) {
+                  const noCloseTime = !latestStatus.closeTime || latestStatus.closeTime === null;
+                  const notWinLoss = latestStatus.result !== 'win' && latestStatus.result !== 'loss';
+                  const isPreviousDay = isBreakoutFromPreviousDay(latestStatus.breakoutTime);
+                  console.log(`[DEBUG ${symbol}] Condition checks:`, {
+                    hasLatestStatus: !!latestStatus,
+                    noCloseTime,
+                    notWinLoss,
+                    shouldReset,
+                    isPreviousDay,
+                    willShow: !shouldReset && noCloseTime && notWinLoss && !isPreviousDay,
+                    lastResetDate: lastResetDateRef.current
+                  });
+                }
+              }
+              
+              // Determine what to show based on status
+              let breakoutTime = '-';
+              let reentryTime = '-';
+              let direction = '-';
+              let distance = '-';
+              
+              // Check if current time is after 15:00 UTC+7 (end of 4H timeframe)
+              // Only clear breakout data if it's from a previous day
+              // Allow same-day breakouts after 15:00 to be shown (they're still today's breakouts)
+              // Note: shouldReset is used to clear OLD breakouts, not same-day ones after 15:00
+              // The actual clearing happens in isBreakoutFromPreviousDay check below
+              // Priority: Show pending breakout/signal if exists, otherwise show closed signal status
+              // LOGIC: Check for pending breakout/signal first (has higher priority)
+              // Show if signal doesn't have closeTime (still active) AND result is not win/loss (not closed)
+              // This matches BreakoutSignalsTable which shows all signals with reentryTime
+              // Accept signals with result: 'pending', undefined, null, or any value except 'win'/'loss'
+              if (latestStatus && 
+                  (!latestStatus.closeTime || latestStatus.closeTime === null) &&
+                  (latestStatus.result === 'pending' || latestStatus.result === undefined || latestStatus.result === null || (latestStatus.result !== 'win' && latestStatus.result !== 'loss'))) {
+                // Check if breakout is from a previous day's 4H timeframe
+                // Only clear if it's from PREVIOUS day - allow same-day breakouts even after 15:00
+                const breakoutTimeForCheck = latestStatus.breakoutTime instanceof Date 
+                  ? latestStatus.breakoutTime 
+                  : new Date(latestStatus.breakoutTime);
+                
+                // Also check if we should reset (after 15:00) AND breakout is from previous day
+                // If breakout is from today (even after 15:00), show it
+                const isPreviousDay = isBreakoutFromPreviousDay(breakoutTimeForCheck);
+                const shouldClearOldBreakout = shouldReset && isPreviousDay;
+                
+                if (shouldClearOldBreakout) {
+                  // Breakout is from previous day AND we're after 15:00 - clear it
+                  breakoutTime = '-';
+                  reentryTime = '-';
+                  direction = '-';
+                  distance = '-';
+                } else if (isPreviousDay && !shouldReset) {
+                  // Breakout is from previous day but we're not after 15:00 yet - still clear it
+                  breakoutTime = '-';
+                  reentryTime = '-';
+                  direction = '-';
+                  distance = '-';
+                } else {
+                  // Breakout is from today, show it
+                  // Check if it's a signal (has reentry) or just a breakout
+                  if (latestStatus.reentryTime) {
+                    // LOGIC 2: Breakout + re-entry exists (ACTIVE/PENDING SIGNAL)
+                    // Show: breakout time, re-entry time, long/short, distance from range
+                    const reentryTimeObj = latestStatus.reentryTime instanceof Date 
+                      ? latestStatus.reentryTime 
+                      : new Date(latestStatus.reentryTime);
+                    
+                    breakoutTime = formatNYTime(breakoutTimeForCheck);
+                    reentryTime = formatNYTime(reentryTimeObj);
+                    direction = latestStatus.breakoutDirection === 'long' ? 'LONG' : 'SHORT';
+                    
+                    // Calculate distance from current price to target (take profit) for open position
+                    // Use currentPrice if available (live price), otherwise use entryPrice
+                    const currentPrice = latestStatus.currentPrice || latestStatus.entryPrice || latestStatus.reentryPrice;
+                    const takeProfit = latestStatus.takeProfit;
+                    
+                    if (currentPrice && takeProfit) {
+                      // For open positions, calculate distance between current price and take profit target
+                      if (latestStatus.breakoutDirection === 'long') {
+                        // LONG position: Distance to TP = (TP - currentPrice) / currentPrice * 100
+                        // Positive = remaining % to reach TP from current price, negative = already past TP
+                        const dist = ((takeProfit - currentPrice) / currentPrice) * 100;
+                        distance = dist >= 0 ? `+${dist.toFixed(2)}%` : `${dist.toFixed(2)}%`;
+                      } else {
+                        // SHORT position: Distance to TP = (currentPrice - TP) / currentPrice * 100
+                        // Positive = remaining % to reach TP from current price, negative = already past TP
+                        const dist = ((currentPrice - takeProfit) / currentPrice) * 100;
+                        distance = dist >= 0 ? `+${dist.toFixed(2)}%` : `${dist.toFixed(2)}%`;
+                      }
+                    } else {
+                      distance = '-';
+                    }
+                  } else {
+                    // LOGIC 1: Only breakout exists (no re-entry)
+                    // Show: breakout time, distance from range
+                    // Do not show: re-entry, long/short, close status
+                    breakoutTime = formatNYTime(breakoutTimeForCheck);
+                    reentryTime = '-';
+                    direction = '-';
+                    
+                    // Calculate distance from range
+                    if (latestStatus.currentPrice) {
+                      if (latestStatus.isAbove) {
+                        const dist = ((latestStatus.currentPrice - latestStatus.rangeHigh) / latestStatus.rangeHigh) * 100;
+                        distance = `+${dist.toFixed(2)}%`;
+                      } else {
+                        const dist = ((latestStatus.rangeLow - latestStatus.currentPrice) / latestStatus.rangeLow) * 100;
+                        distance = `+${dist.toFixed(2)}%`;
+                      }
+                    }
+                  }
+                }
+              }
+              // LOGIC: If no pending breakout, check for closed signal
+              // If there's a closed signal, show close status
+              // If closed outside the range, show close time as breakout time
+              else if (latestClosedSignal && closeTime !== '-') {
+                // First, check if the closed position was closed outside the range
+                const isWin = latestClosedSignal.result === 'win';
+                let closedOutsideRange = false;
+                
+                if (latestClosedSignal.takeProfit && latestClosedSignal.stopLoss && latestClosedSignal.breakoutDirection) {
+                  if (latestClosedSignal.breakoutDirection === 'long') {
+                    // LONG position:
+                    // - WIN (TP hit): Close price = TP. If TP > rangeHigh, we closed above = outside
+                    // - LOSS (SL hit): Close price = SL. If SL < rangeLow, we closed below = outside
+                    if (isWin) {
+                      closedOutsideRange = latestClosedSignal.takeProfit > latestClosedSignal.rangeHigh;
+                    } else {
+                      closedOutsideRange = latestClosedSignal.stopLoss < latestClosedSignal.rangeLow;
+                    }
+                  } else if (latestClosedSignal.breakoutDirection === 'short') {
+                    // SHORT position:
+                    // - WIN (TP hit): Close price = TP. If TP < rangeLow, we closed below = outside
+                    // - LOSS (SL hit): Close price = SL. If SL > rangeHigh, we closed above = outside
+                    if (isWin) {
+                      closedOutsideRange = latestClosedSignal.takeProfit < latestClosedSignal.rangeLow;
+                    } else {
+                      closedOutsideRange = latestClosedSignal.stopLoss > latestClosedSignal.rangeHigh;
+                    }
+                  }
+                }
+                
+                // Check if there's a new breakout after the closed signal
+                const hasNewBreakoutAfterClose = latestStatus && 
+                  latestStatus.breakoutTime instanceof Date && 
+                  latestClosedSignal.closeTime instanceof Date &&
+                  latestStatus.breakoutTime > latestClosedSignal.closeTime;
+                
+                if (hasNewBreakoutAfterClose) {
+                  // LOGIC 4: Close status exists + new breakout after close
+                  // Show: close status + new breakout time + distance from range
+                  // Do not show: reentry, long/short from breakout
+                  
+                  // Check if the new breakout is from a previous day's 4H timeframe
+                  const newBreakoutTimeObj = latestStatus.breakoutTime instanceof Date 
+                    ? latestStatus.breakoutTime 
+                    : new Date(latestStatus.breakoutTime);
+                  
+                  if (isBreakoutFromPreviousDay(newBreakoutTimeObj)) {
+                    // New breakout is from previous day, clear it (only show close status)
+                    breakoutTime = '-';
+                    reentryTime = '-';
+                    direction = '-';
+                    distance = '-';
+                  } else {
+                    // Show the new breakout time and distance
+                    breakoutTime = formatNYTime(newBreakoutTimeObj);
+                    reentryTime = '-';
+                    direction = '-';
+                    
+                    // Calculate distance from range for the new breakout
+                    if (latestStatus.currentPrice) {
+                      if (latestStatus.isAbove) {
+                        const dist = ((latestStatus.currentPrice - latestStatus.rangeHigh) / latestStatus.rangeHigh) * 100;
+                        distance = `+${dist.toFixed(2)}%`;
+                      } else {
+                        const dist = ((latestStatus.rangeLow - latestStatus.currentPrice) / latestStatus.rangeLow) * 100;
+                        distance = `+${dist.toFixed(2)}%`;
+                      }
+                    }
+                  }
+                } else if (closedOutsideRange) {
+                  // LOGIC 3b: Close status exists + closed outside the range
+                  // Show: close status + close time as breakout time + distance from range
+                  // Do not show: reentry, long/short
+                  breakoutTime = closeTime; // Show close time as breakout time
+                  reentryTime = '-';
+                  direction = '-';
+                  
+                  // Calculate distance from range based on close price (TP or SL)
+                  // Since closedOutsideRange is true, we know the position closed outside
+                  const closePrice = isWin ? latestClosedSignal.takeProfit : latestClosedSignal.stopLoss;
+                  if (closePrice && latestClosedSignal.rangeHigh && latestClosedSignal.rangeLow) {
+                    if (latestClosedSignal.breakoutDirection === 'long') {
+                      // LONG position: closedOutsideRange true means either:
+                      // - WIN: TP > rangeHigh (closed above) 
+                      // - LOSS: SL < rangeLow (closed below)
+                      if (isWin) {
+                        // Closed at TP above range
+                        const dist = ((closePrice - latestClosedSignal.rangeHigh) / latestClosedSignal.rangeHigh) * 100;
+                        distance = `+${dist.toFixed(2)}%`;
+                      } else {
+                        // Closed at SL below range
+                        const dist = ((latestClosedSignal.rangeLow - closePrice) / latestClosedSignal.rangeLow) * 100;
+                        distance = `-${dist.toFixed(2)}%`;
+                      }
+                    } else {
+                      // SHORT position: closedOutsideRange true means either:
+                      // - WIN: TP < rangeLow (closed below)
+                      // - LOSS: SL > rangeHigh (closed above)
+                      if (isWin) {
+                        // Closed at TP below range
+                        const dist = ((latestClosedSignal.rangeLow - closePrice) / latestClosedSignal.rangeLow) * 100;
+                        distance = `-${dist.toFixed(2)}%`;
+                      } else {
+                        // Closed at SL above range
+                        const dist = ((closePrice - latestClosedSignal.rangeHigh) / latestClosedSignal.rangeHigh) * 100;
+                        distance = `+${dist.toFixed(2)}%`;
+                      }
+                    }
+                  } else {
+                    distance = '-';
+                  }
+                } else {
+                  // LOGIC 3a: Close status exists, closed inside range, no new breakout after
+                  // Show: close status only
+                  // Do not show: breakout, reentry, long/short, distance
+                  breakoutTime = '-';
+                  reentryTime = '-';
+                  direction = '-';
+                  distance = '-';
+                }
+              }
+              
+              // If after 15:00 UTC+7 and close status is from previous day, clear close status
+              // Only clear close status if it's from a previous day (not today's close)
+              let finalCloseTime = closeTime;
+              if (shouldReset && latestClosedSignal && latestClosedSignal.closeTime) {
+                const closeTimeForCheck = latestClosedSignal.closeTime instanceof Date 
+                  ? latestClosedSignal.closeTime 
+                  : new Date(latestClosedSignal.closeTime);
+                const isPreviousDayClose = isBreakoutFromPreviousDay(closeTimeForCheck);
+                if (isPreviousDayClose) {
+                  finalCloseTime = '-';
+                }
+              }
+              
+              const directionBadge = direction === 'LONG' 
+                ? { text: 'LONG', color: '#6bcf7f', bgColor: 'rgba(107, 207, 127, 0.2)' }
+                : direction === 'SHORT'
+                ? { text: 'SHORT', color: '#ff6b6b', bgColor: 'rgba(255, 107, 107, 0.2)' }
+                : null;
               
               return (
-                <tr key={index} className={isOversold ? 'rsi-row-oversold' : ''}>
+                <tr key={index}>
                   <td>
-                    {isOversold && <span className="warning-icon">⚠️</span>}
                     <strong>{symbol}</strong>
                   </td>
-                  <td>{formatTimestamp(item.previous_timestamp)}</td>
-                  <td>{formatTimestamp(item.timestamp)}</td>
-                  <td>{prevRSI !== null ? prevRSI.toFixed(2) : 'N/A'}</td>
-                  <td>{prevMA !== null ? prevMA.toFixed(2) : 'N/A'}</td>
                   <td>
                     <span className="rsi-value" style={{ 
                       color: currSignal?.color || '#fff',
@@ -754,17 +1126,43 @@ const RSITable = ({ data, loading, error, onRefresh, selectedCryptos, isExpanded
                       {currRSI !== null ? currRSI.toFixed(2) : 'N/A'}
                     </span>
                   </td>
-                  <td>{currMA !== null ? currMA.toFixed(2) : 'N/A'}</td>
-                  <td>${price !== null ? price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : 'N/A'}</td>
+                  <td>{breakoutTime}</td>
+                  <td>{reentryTime}</td>
                   <td>
-                    {currSignal && (
-                      <span className="signal-badge" style={{ 
-                        backgroundColor: currSignal.bgColor,
-                        color: currSignal.color,
-                        borderColor: currSignal.color
+                    {directionBadge ? (
+                      <span className="direction-badge" style={{ 
+                        backgroundColor: directionBadge.bgColor,
+                        color: directionBadge.color,
+                        borderColor: directionBadge.color
                       }}>
-                        {currSignal.text}
+                        {directionBadge.text}
                       </span>
+                    ) : (
+                      <span style={{ opacity: 0.6 }}>-</span>
+                    )}
+                  </td>
+                  <td>
+                    {finalCloseTime !== '-' ? (
+                      <span style={{ 
+                        color: '#6bcf7f',
+                        fontWeight: 'bold'
+                      }}>
+                        {finalCloseTime}
+                      </span>
+                    ) : (
+                      <span style={{ opacity: 0.6 }}>-</span>
+                    )}
+                  </td>
+                  <td>
+                    {distance !== '-' ? (
+                      <span style={{ 
+                        color: directionBadge?.color || '#fff',
+                        fontWeight: 'bold'
+                      }}>
+                        {distance}
+                      </span>
+                    ) : (
+                      <span style={{ opacity: 0.6 }}>-</span>
                     )}
                   </td>
                 </tr>
@@ -774,17 +1172,21 @@ const RSITable = ({ data, loading, error, onRefresh, selectedCryptos, isExpanded
         </table>
       </div>
       <div className="rsi-table-footer">
-        <p>Total cryptocurrencies analyzed: <strong>{filteredData.length}</strong> {filteredData.length !== data.length && `(filtered from ${data.length})`}</p>
+        <p>Total cryptocurrencies analyzed: <strong>{filteredRsiData.length}</strong> {filteredRsiData.length !== rsiData.length && `(filtered from ${rsiData.length})`}</p>
       </div>
     </div>
   );
 };
 
 // Oversold History Table Component
-const OversoldHistoryTable = ({ data, loading, error, onRefresh, selectedCryptos, isExpanded, onToggleExpanded, lastUpdateTime }) => {
-  // Filter data by selected cryptocurrencies
-  const filteredData = filterDataByCryptos(data, selectedCryptos);
-  const dataCount = filteredData ? filteredData.length : 0;
+const OversoldHistoryTable = ({ data, loading, error, onRefresh, selectedCryptos, onToggleCrypto, isExpanded, onToggleExpanded, lastUpdateTime }) => {
+  // Filter data by selected cryptocurrencies (show/hide)
+  const normalizedData = normalizeDates(data || []);
+  const filteredData = normalizedData.filter(item => {
+    const symbol = (item.symbol || '').replace('/USDT', '');
+    return selectedCryptos.has(symbol);
+  });
+  const dataCount = filteredData.length;
 
   if (!isExpanded) {
     return (
@@ -871,14 +1273,17 @@ const OversoldHistoryTable = ({ data, loading, error, onRefresh, selectedCryptos
       </div>
       <div className="oversold-info">
         <p className="oversold-count">
-          <strong>[DATA]</strong> Found <strong>{filteredData.length}</strong> RSI ≤ 30 events in the last 3 days {filteredData.length !== data.length && `(filtered from ${data.length})`}:
+          <strong>[DATA]</strong> Found <strong>{filteredData.length}</strong> RSI ≤ 30 events in the last 3 days:
         </p>
       </div>
       
       {/* Summary: Count per cryptocurrency and unique time periods */}
       {(() => {
+        // Use all data (not filtered) for summary display
+        const allData = normalizedData;
+        
         // Count per cryptocurrency
-        const summary = filteredData.reduce((acc, item) => {
+        const summary = allData.reduce((acc, item) => {
           const symbol = item.symbol.replace('/USDT', '');
           acc[symbol] = (acc[symbol] || 0) + 1;
           return acc;
@@ -891,7 +1296,7 @@ const OversoldHistoryTable = ({ data, loading, error, onRefresh, selectedCryptos
         const timePeriodMap = new Map(); // date -> Set of hours
         const dayTimePeriodMap = new Map(); // date -> Set of hours (only 06:00-22:00)
         
-        filteredData.forEach(item => {
+        allData.forEach(item => {
           const date = formatDate(item.timestamp); // e.g., "2025-10-29"
           const time = formatTime(item.timestamp); // e.g., "14:00"
           const hour = parseInt(time.split(':')[0], 10); // Extract hour as number
@@ -954,12 +1359,37 @@ const OversoldHistoryTable = ({ data, loading, error, onRefresh, selectedCryptos
               </div>
             </div>
             <div className="oversold-summary-grid">
-              {summaryEntries.map(([symbol, count]) => (
-                <div key={symbol} className="oversold-summary-item">
+              {summaryEntries.map(([symbol, count]) => {
+                const isSelected = selectedCryptos.has(symbol);
+                
+                return (
+                  <div 
+                    key={symbol} 
+                    className="oversold-summary-item"
+                    onClick={() => onToggleCrypto(symbol)}
+                    style={{ 
+                      backgroundColor: isSelected ? 'rgba(107, 207, 127, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+                      border: isSelected ? '2px solid #6bcf7f' : '2px solid transparent',
+                      cursor: 'pointer',
+                      transition: 'all 0.2s ease',
+                      opacity: isSelected ? 1 : 0.6
+                    }}
+                    onMouseEnter={(e) => {
+                      if (!isSelected) {
+                        e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.1)';
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      if (!isSelected) {
+                        e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.05)';
+                      }
+                    }}
+                  >
                   <span className="summary-symbol"><strong>{symbol}</strong></span>
                   <span className="summary-count">{count} {count === 1 ? 'time' : 'times'}</span>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         );
@@ -999,7 +1429,7 @@ const OversoldHistoryTable = ({ data, loading, error, onRefresh, selectedCryptos
         </table>
       </div>
       <div className="oversold-table-footer">
-        <p>Total events: <strong>{filteredData.length}</strong> {filteredData.length !== data.length && `(filtered from ${data.length})`}</p>
+        <p>Total events: <strong>{filteredData.length}</strong></p>
       </div>
     </div>
   );
@@ -1007,9 +1437,13 @@ const OversoldHistoryTable = ({ data, loading, error, onRefresh, selectedCryptos
 
 // Breakouts Without Re-entry Table Component
 const BreakoutsWithoutReentryTable = ({ data, loading, error, onRefresh, selectedCryptos, isExpanded, onToggleExpanded, lastUpdateTime }) => {
-  // Filter data by selected cryptocurrencies
-  const filteredData = filterDataByCryptos(data, selectedCryptos);
-  const dataCount = filteredData ? filteredData.length : 0;
+  // Filter data by selected cryptocurrencies (show/hide)
+  const normalizedData = normalizeDates(data || []);
+  const filteredData = normalizedData.filter(item => {
+    const symbol = (item.symbol || '').replace('/USDT', '');
+    return selectedCryptos.has(symbol);
+  });
+  const dataCount = filteredData.length;
 
   if (!isExpanded) {
     return (
@@ -1097,7 +1531,7 @@ const BreakoutsWithoutReentryTable = ({ data, loading, error, onRefresh, selecte
       </div>
       <div className="breakout-info">
         <p className="breakout-count">
-          <strong>[DATA]</strong> Found <strong>{filteredData.length}</strong> breakouts without re-entry {filteredData.length !== data.length && `(filtered from ${data.length})`}:
+          <strong>[DATA]</strong> Found <strong>{filteredData.length}</strong> breakouts without re-entry:
         </p>
       </div>
       
@@ -1180,19 +1614,47 @@ const BreakoutsWithoutReentryTable = ({ data, loading, error, onRefresh, selecte
         </table>
       </div>
       <div className="breakout-table-footer">
-        <p>Total breakouts without re-entry: <strong>{filteredData.length}</strong> {filteredData.length !== data.length && `(filtered from ${data.length})`}</p>
+        <p>Total breakouts without re-entry: <strong>{filteredData.length}</strong></p>
       </div>
     </div>
   );
 };
 
 // Breakout Trading Signals Table Component
-const BreakoutSignalsTable = ({ data, loading, error, onRefresh, selectedCryptos, isExpanded, onToggleExpanded, lastUpdateTime }) => {
-  // Filter data by selected cryptocurrencies
-  const filteredDataRaw = filterDataByCryptos(data, selectedCryptos);
+const BreakoutSignalsTable = ({ data, loading, error, onRefresh, selectedCryptos, onToggleCrypto, isExpanded, onToggleExpanded, lastUpdateTime }) => {
+  // Filter data by selected cryptocurrencies (show/hide)
+  const normalizedData = normalizeDates(data || []);
   
-  // Ensure dates are normalized and sort by reentryTime (most recent first - descending order)
-  const filteredData = normalizeDates(filteredDataRaw || []).sort((a, b) => {
+  // Calculate 24 hours ago from current time
+  const now = new Date();
+  const twentyFourHoursAgo = now.getTime() - (24 * 60 * 60 * 1000);
+  
+  // Filter by selected cryptos AND last 24 hours (based on exit time for closed, entry time for pending)
+  const filteredDataRaw = normalizedData.filter(item => {
+    const symbol = (item.symbol || '').replace('/USDT', '');
+    if (!selectedCryptos.has(symbol)) {
+      return false;
+    }
+    
+    // Determine the time to check: use closeTime (exit time) if closed, otherwise use reentryTime (entry time)
+    let timeToCheck = null;
+    if (item.closeTime) {
+      // Signal is closed - use exit time (closeTime)
+      timeToCheck = item.closeTime instanceof Date ? item.closeTime : new Date(item.closeTime);
+    } else if (item.reentryTime) {
+      // Signal is pending/open - use entry time (reentryTime)
+      timeToCheck = item.reentryTime instanceof Date ? item.reentryTime : new Date(item.reentryTime);
+    } else {
+      // No time available, exclude it
+      return false;
+    }
+    
+    // Only include if timeToCheck is within last 24 hours
+    return timeToCheck.getTime() >= twentyFourHoursAgo;
+  });
+  
+  // Sort by reentryTime (most recent first - descending order)
+  const filteredData = filteredDataRaw.sort((a, b) => {
     const aTime = a.reentryTime instanceof Date ? a.reentryTime.getTime() : new Date(a.reentryTime).getTime();
     const bTime = b.reentryTime instanceof Date ? b.reentryTime.getTime() : new Date(b.reentryTime).getTime();
     return bTime - aTime; // Descending order (most recent first)
@@ -1286,14 +1748,15 @@ const BreakoutSignalsTable = ({ data, loading, error, onRefresh, selectedCryptos
       </div>
       <div className="breakout-info">
         <p className="breakout-count">
-          <strong>[DATA]</strong> Found <strong>{filteredData.length}</strong> trading signals {filteredData.length !== data.length && `(filtered from ${data.length})`}:
+          <strong>[DATA]</strong> Found <strong>{filteredData.length}</strong> trading signals:
         </p>
       </div>
       
       {/* Summary by Cryptocurrency */}
       {(() => {
-        // Group signals by symbol
-        const summaryBySymbol = filteredData.reduce((acc, signal) => {
+        // Group signals by symbol - use all data for summary (not filtered)
+        const allData = normalizeDates(data || []);
+        const summaryBySymbol = allData.reduce((acc, signal) => {
           const symbol = signal.symbol || 'Unknown';
           if (!acc[symbol]) {
             acc[symbol] = {
@@ -1312,7 +1775,20 @@ const BreakoutSignalsTable = ({ data, loading, error, onRefresh, selectedCryptos
         }, {});
         
         const summaryEntries = Object.values(summaryBySymbol)
-          .sort((a, b) => b.total - a.total); // Sort by total signals descending
+          .map(summary => {
+            // Calculate win rate for sorting
+            const completed = summary.wins + summary.losses;
+            const winRate = completed > 0 ? (summary.wins / completed) * 100 : 0;
+            return { ...summary, winRate, completed };
+          })
+          .sort((a, b) => {
+            // Primary sort: by win rate descending (highest first)
+            if (b.winRate !== a.winRate) {
+              return b.winRate - a.winRate;
+            }
+            // Secondary sort: by total signals descending
+            return b.total - a.total;
+          });
         
         if (summaryEntries.length === 0) return null;
         
@@ -1323,19 +1799,38 @@ const BreakoutSignalsTable = ({ data, loading, error, onRefresh, selectedCryptos
             </div>
             <div className="oversold-summary-grid">
               {summaryEntries.map((summary) => {
-                const completed = summary.wins + summary.losses;
-                const winRate = completed > 0 ? ((summary.wins / completed) * 100).toFixed(2) : '0.00';
+                const winRate = summary.winRate.toFixed(2);
                 const winLossRatio = summary.losses > 0 ? (summary.wins / summary.losses).toFixed(2) : (summary.wins > 0 ? '∞' : '0.00');
+                const isSelected = selectedCryptos.has(summary.symbol);
                 
                 return (
-                  <div key={summary.symbol} className="oversold-summary-item" style={{ 
+                  <div 
+                    key={summary.symbol} 
+                    className="oversold-summary-item" 
+                    onClick={() => onToggleCrypto(summary.symbol)}
+                    style={{ 
                     display: 'flex', 
                     flexDirection: 'column',
                     gap: '0.25rem',
                     padding: '0.75rem',
                     borderRadius: '4px',
-                    backgroundColor: 'rgba(255, 255, 255, 0.05)'
-                  }}>
+                      backgroundColor: isSelected ? 'rgba(107, 207, 127, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+                      border: isSelected ? '2px solid #6bcf7f' : '2px solid transparent',
+                      cursor: 'pointer',
+                      transition: 'all 0.2s ease',
+                      opacity: isSelected ? 1 : 0.6
+                    }}
+                    onMouseEnter={(e) => {
+                      if (!isSelected) {
+                        e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.1)';
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      if (!isSelected) {
+                        e.currentTarget.style.backgroundColor = 'rgba(255, 255, 255, 0.05)';
+                      }
+                    }}
+                  >
                     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.25rem' }}>
                       <span className="summary-symbol"><strong>{summary.symbol}</strong></span>
                       <span className="summary-count" style={{ fontSize: '0.9rem', opacity: 0.8 }}>
@@ -1355,7 +1850,7 @@ const BreakoutSignalsTable = ({ data, loading, error, onRefresh, selectedCryptos
                         </span>
                       )}
                     </div>
-                    {completed > 0 && (
+                    {summary.completed > 0 && (
                       <div style={{ fontSize: '0.85rem', marginTop: '0.25rem' }}>
                         <span style={{ 
                           color: parseFloat(winRate) >= 50 ? '#6bcf7f' : '#ff6b6b',
@@ -1382,12 +1877,10 @@ const BreakoutSignalsTable = ({ data, loading, error, onRefresh, selectedCryptos
             <tr>
               <th>Symbol</th>
               <th>Range (High/Low)</th>
-              <th>Time Exit</th>
-              <th>Time Reentry</th>
-              <th>Long/Short @ Price</th>
-              <th>TP/SL (1:2)</th>
+              <th>Time E/R/C</th>
+              <th>Long/Short</th>
+              <th>TP/SL</th>
               <th>Gain %</th>
-              <th>Win/Loss</th>
               <th>Simulation ($1000 @ 50x)</th>
             </tr>
           </thead>
@@ -1455,10 +1948,31 @@ const BreakoutSignalsTable = ({ data, loading, error, onRefresh, selectedCryptos
                       <span className="range-item">
                         <strong>Low:</strong> ${signal.rangeLow ? formatPrice(signal.rangeLow) : 'N/A'}
                       </span>
+                      {signal.rangeCloseTime && (() => {
+                        const dateAt1100 = getDateAt1100UTC7(signal.rangeCloseTime);
+                        return dateAt1100 ? (
+                          <span className="range-item" style={{ marginTop: '0.25rem', fontSize: '0.85rem', opacity: 0.8 }}>
+                            {formatNYTime(dateAt1100)}
+                          </span>
+                        ) : (
+                          <span className="range-item" style={{ marginTop: '0.25rem', fontSize: '0.85rem', opacity: 0.8 }}>
+                            11:00
+                          </span>
+                        );
+                      })()}
                     </div>
                   </td>
-                  <td>{formatNYTime(signal.breakoutTime)}</td>
-                  <td>{formatNYTime(signal.reentryTime)}</td>
+                  <td>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.2rem', fontSize: '0.9rem' }}>
+                      <span>{formatNYTime(signal.breakoutTime)}</span>
+                      <span>{formatNYTime(signal.reentryTime)}</span>
+                      {signal.closeTime && (
+                        <span style={{ marginTop: '0.2rem' }}>
+                          {formatNYTime(signal.closeTime)}
+                        </span>
+                      )}
+                    </div>
+                  </td>
                   <td>
                     <span className="direction-badge" style={{ 
                       backgroundColor: directionBadge.bgColor,
@@ -1487,17 +2001,6 @@ const BreakoutSignalsTable = ({ data, loading, error, onRefresh, selectedCryptos
                     }}>
                       {gainPercent !== 'N/A' ? (isLoss ? `-${gainPercent}%` : `+${gainPercent}%`) : gainPercent}
                     </span>
-                  </td>
-                  <td>
-                    {isWin && (
-                      <span className="result-badge win-badge">WIN</span>
-                    )}
-                    {isLoss && (
-                      <span className="result-badge loss-badge">LOSS</span>
-                    )}
-                    {isPending && (
-                      <span className="result-badge pending-badge">PENDING</span>
-                    )}
                   </td>
                   <td>
                     {simulation.profit !== null && simulation.loss !== null ? (
@@ -1621,7 +2124,7 @@ const BreakoutSignalsTable = ({ data, loading, error, onRefresh, selectedCryptos
           
           return (
             <>
-              <p>Total signals: <strong>{filteredData.length}</strong> {filteredData.length !== data.length && `(filtered from ${data.length})`}</p>
+              <p>Total signals: <strong>{filteredData.length}</strong></p>
               <p style={{ marginTop: '0.5rem', fontSize: '0.9rem', opacity: 0.8 }}>
                 Win: <strong style={{ color: '#6bcf7f' }}>{wins}</strong> | 
                 Loss: <strong style={{ color: '#ff6b6b' }}>{losses}</strong> | 
@@ -1771,16 +2274,39 @@ function App() {
   const [breakoutSignals, setBreakoutSignals] = useState({ data: null, loading: false, error: null, lastUpdateTime: null });
   const [breakoutsWithoutReentry, setBreakoutsWithoutReentry] = useState({ data: null, loading: false, error: null, lastUpdateTime: null });
   
-  // Cryptocurrency filter state (stored in localStorage)
-  const [selectedCryptos, setSelectedCryptos] = useState(() => {
+  // Cryptocurrency filter state for Oversold History (stored in localStorage)
+  const [oversoldSelectedCryptos, setOversoldSelectedCryptos] = useState(() => {
     try {
-      const saved = localStorage.getItem('crypto_filter_selection');
+      const saved = localStorage.getItem('oversold_filter_selection');
       if (saved) {
         const parsed = JSON.parse(saved);
-        return new Set(parsed);
+        const savedSet = new Set(parsed);
+        // Ensure all current DEFAULT_SYMBOLS are included (merge with saved selection)
+        const allCryptos = DEFAULT_SYMBOLS.map(s => s.replace('/USDT', ''));
+        allCryptos.forEach(crypto => savedSet.add(crypto));
+        return savedSet;
       }
     } catch (e) {
-      console.warn('Failed to load crypto filter from localStorage:', e);
+      console.warn('Failed to load oversold filter from localStorage:', e);
+    }
+    // Default: all cryptocurrencies selected
+    return new Set(DEFAULT_SYMBOLS.map(s => s.replace('/USDT', '')));
+  });
+
+  // Cryptocurrency filter state for Breakout Signals (stored in localStorage)
+  const [breakoutSignalsSelectedCryptos, setBreakoutSignalsSelectedCryptos] = useState(() => {
+    try {
+      const saved = localStorage.getItem('breakout_signals_filter_selection');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        const savedSet = new Set(parsed);
+        // Ensure all current DEFAULT_SYMBOLS are included (merge with saved selection)
+        const allCryptos = DEFAULT_SYMBOLS.map(s => s.replace('/USDT', ''));
+        allCryptos.forEach(crypto => savedSet.add(crypto));
+        return savedSet;
+      }
+    } catch (e) {
+      console.warn('Failed to load breakout signals filter from localStorage:', e);
     }
     // Default: all cryptocurrencies selected
     return new Set(DEFAULT_SYMBOLS.map(s => s.replace('/USDT', '')));
@@ -1798,22 +2324,68 @@ function App() {
     }
     // Default: all sections expanded
     return {
-      dashboard: true,
-      rsi: true,
+      mergedRSIBreakout: true,
       oversold: true,
-      breakoutSignals: true,
-      breakoutsWithoutReentry: true
+      breakoutSignals: true
     };
   });
 
-  // Save filter selection to localStorage whenever it changes
+  // Notification state
+  const [notificationsEnabled, setNotificationsEnabled] = useState(() => {
+    try {
+      const saved = localStorage.getItem('notifications_enabled');
+      return saved === 'true';
+    } catch (e) {
+      console.warn('Failed to load notifications enabled state:', e);
+      return false;
+    }
+  });
+
+  const [notificationPermission, setNotificationPermission] = useState('default');
+  const [serviceWorkerRegistration, setServiceWorkerRegistration] = useState(null);
+  
+  // Track notified breakouts to avoid duplicates (store in localStorage)
+  const notifiedBreakoutsRef = useRef(new Set());
+  
+  // Load notified breakouts from localStorage on mount
   useEffect(() => {
     try {
-      localStorage.setItem('crypto_filter_selection', JSON.stringify(Array.from(selectedCryptos)));
+      const saved = localStorage.getItem('notified_breakouts');
+      if (saved) {
+        const breakouts = JSON.parse(saved);
+        notifiedBreakoutsRef.current = new Set(breakouts);
+      }
     } catch (e) {
-      console.warn('Failed to save crypto filter to localStorage:', e);
+      console.warn('Failed to load notified breakouts:', e);
     }
-  }, [selectedCryptos]);
+  }, []);
+
+  // Save notified breakouts to localStorage
+  const saveNotifiedBreakouts = () => {
+    try {
+      const breakouts = Array.from(notifiedBreakoutsRef.current);
+      localStorage.setItem('notified_breakouts', JSON.stringify(breakouts));
+    } catch (e) {
+      console.warn('Failed to save notified breakouts:', e);
+    }
+  };
+
+  // Save filter selections to localStorage whenever they change
+  useEffect(() => {
+    try {
+      localStorage.setItem('oversold_filter_selection', JSON.stringify(Array.from(oversoldSelectedCryptos)));
+    } catch (e) {
+      console.warn('Failed to save oversold filter to localStorage:', e);
+    }
+  }, [oversoldSelectedCryptos]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('breakout_signals_filter_selection', JSON.stringify(Array.from(breakoutSignalsSelectedCryptos)));
+    } catch (e) {
+      console.warn('Failed to save breakout signals filter to localStorage:', e);
+    }
+  }, [breakoutSignalsSelectedCryptos]);
 
   // Save section expanded state to localStorage whenever it changes
   useEffect(() => {
@@ -1832,41 +2404,9 @@ function App() {
     }));
   };
 
-  // Expand RSI section from dashboard
-  const expandRSISection = () => {
-    setExpandedSections(prev => ({
-      ...prev,
-      rsi: true,
-      dashboard: false // Optionally collapse dashboard when expanding a section
-    }));
-    // Scroll to RSI section (second .rsi-main-section after dashboard)
-    setTimeout(() => {
-      const sections = document.querySelectorAll('.rsi-main-section');
-      if (sections.length > 1) {
-        sections[1].scrollIntoView({ behavior: 'smooth', block: 'start' });
-      }
-    }, 100);
-  };
-
-  // Expand Breakouts Without Re-entry section from dashboard
-  const expandBreakoutsSection = () => {
-    setExpandedSections(prev => ({
-      ...prev,
-      breakoutsWithoutReentry: true,
-      dashboard: false // Optionally collapse dashboard when expanding a section
-    }));
-    // Scroll to Breakouts section (last .rsi-main-section)
-    setTimeout(() => {
-      const sections = document.querySelectorAll('.rsi-main-section');
-      if (sections.length > 4) {
-        sections[4].scrollIntoView({ behavior: 'smooth', block: 'start' });
-      }
-    }, 100);
-  };
-
-  // Filter handlers
-  const toggleCrypto = (crypto) => {
-    setSelectedCryptos(prev => {
+  // Filter handlers for Oversold History
+  const toggleOversoldCrypto = (crypto) => {
+    setOversoldSelectedCryptos(prev => {
       const newSet = new Set(prev);
       if (newSet.has(crypto)) {
         newSet.delete(crypto);
@@ -1877,12 +2417,17 @@ function App() {
     });
   };
 
-  const selectAllCryptos = () => {
-    setSelectedCryptos(new Set(DEFAULT_SYMBOLS.map(s => s.replace('/USDT', ''))));
-  };
-
-  const deselectAllCryptos = () => {
-    setSelectedCryptos(new Set());
+  // Filter handlers for Breakout Signals
+  const toggleBreakoutSignalsCrypto = (crypto) => {
+    setBreakoutSignalsSelectedCryptos(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(crypto)) {
+        newSet.delete(crypto);
+      } else {
+        newSet.add(crypto);
+      }
+      return newSet;
+    });
   };
 
   // Fetch RSI directly from Binance API
@@ -1923,24 +2468,208 @@ function App() {
     }
   };
 
-  // Fetch breakout trading signals
+  // Helper function to calculate distance from range
+  const calculateDistanceFromRange = (breakout) => {
+    if (!breakout.currentPrice || !breakout.rangeHigh || !breakout.rangeLow) {
+      return null;
+    }
+
+    if (breakout.isAbove) {
+      // Above range: distance = ((currentPrice - rangeHigh) / rangeHigh) * 100
+      return ((breakout.currentPrice - breakout.rangeHigh) / breakout.rangeHigh) * 100;
+    } else {
+      // Below range: distance = ((rangeLow - currentPrice) / rangeLow) * 100
+      return ((breakout.rangeLow - breakout.currentPrice) / breakout.rangeLow) * 100;
+    }
+  };
+
+  // Helper function to check for new breakouts and send notifications
+  const checkAndNotifyNewBreakouts = (newSignals, oldSignals = [], newBreakoutsWithoutReentry = [], oldBreakoutsWithoutReentry = []) => {
+    if (!notificationsEnabled || notificationPermission !== 'granted') {
+      return;
+    }
+
+    // 1. Check for new breakouts with re-entry (BREAKOUT notification)
+    if (newSignals && Array.isArray(newSignals)) {
+      // Create a map of old signals for quick lookup
+      const oldSignalsMap = new Map();
+      if (oldSignals && Array.isArray(oldSignals)) {
+        oldSignals.forEach(signal => {
+          if (signal.reentryTime) {
+            const key = `signal_${signal.symbol}_${signal.reentryTime instanceof Date ? signal.reentryTime.getTime() : new Date(signal.reentryTime).getTime()}`;
+            oldSignalsMap.set(key, signal);
+          }
+        });
+      }
+
+      // Find new signals (signals with re-entry that weren't in old data)
+      newSignals.forEach(signal => {
+        if (!signal.reentryTime) return; // Only notify for signals with re-entry
+        if (signal.result === 'win' || signal.result === 'loss') return; // Don't notify for closed positions
+        
+        const reentryTime = signal.reentryTime instanceof Date 
+          ? signal.reentryTime 
+          : new Date(signal.reentryTime);
+        const key = `signal_${signal.symbol}_${reentryTime.getTime()}`;
+        
+        // Check if this is a new signal (not in old data and not already notified)
+        const isNewSignal = !oldSignalsMap.has(key);
+        const alreadyNotified = notifiedBreakoutsRef.current.has(key);
+        
+        if (isNewSignal && !alreadyNotified) {
+          // This is a new breakout with re-entry - send notification
+          const notification = formatBreakoutNotification(
+            signal.symbol || 'UNKNOWN',
+            signal.breakoutTime,
+            signal.reentryTime,
+            signal.breakoutDirection,
+            formatNYTime // Pass formatNYTime function
+          );
+          
+          sendNotification(notification.title, {
+            body: notification.body,
+            icon: notification.icon,
+            tag: notification.tag,
+            data: notification.data
+          }).then(sent => {
+            if (sent) {
+              // Mark as notified
+              notifiedBreakoutsRef.current.add(key);
+              saveNotifiedBreakouts();
+              console.log(`[Notifications] Sent BREAKOUT notification for ${signal.symbol}`);
+            }
+          });
+        }
+      });
+    }
+
+    // 2. Check for distance from range < 1% (DISTANCE notification)
+    if (newBreakoutsWithoutReentry && Array.isArray(newBreakoutsWithoutReentry)) {
+      // Create a map of old breakouts for quick lookup
+      const oldBreakoutsMap = new Map();
+      if (oldBreakoutsWithoutReentry && Array.isArray(oldBreakoutsWithoutReentry)) {
+        oldBreakoutsWithoutReentry.forEach(breakout => {
+          if (breakout.breakoutTime) {
+            const key = `distance_${breakout.symbol}_${breakout.breakoutTime instanceof Date ? breakout.breakoutTime.getTime() : new Date(breakout.breakoutTime).getTime()}`;
+            oldBreakoutsMap.set(key, breakout);
+          }
+        });
+      }
+
+      // Check each breakout for distance < 1%
+      newBreakoutsWithoutReentry.forEach(breakout => {
+        if (!breakout.breakoutTime) return;
+        
+        const breakoutTime = breakout.breakoutTime instanceof Date 
+          ? breakout.breakoutTime 
+          : new Date(breakout.breakoutTime);
+        const key = `distance_${breakout.symbol}_${breakoutTime.getTime()}`;
+        
+        // Calculate distance from range
+        const distancePercent = calculateDistanceFromRange(breakout);
+        
+        if (distancePercent !== null && Math.abs(distancePercent) < 1) {
+          // Distance is less than 1% - check if we should notify
+          const alreadyNotified = notifiedBreakoutsRef.current.has(key);
+          
+          if (!alreadyNotified) {
+            // Send notification for distance < 1%
+            const symbolName = breakout.symbol || 'UNKNOWN';
+            const direction = breakout.isAbove ? 'LONG' : 'SHORT';
+            const distanceText = distancePercent >= 0 
+              ? `+${distancePercent.toFixed(2)}%` 
+              : `${distancePercent.toFixed(2)}%`;
+            
+            sendNotification(`📊 ${symbolName} Close to Range`, {
+              body: `${direction} breakout is ${distanceText} from range\nBreakout: ${formatNYTime(breakoutTime)}`,
+              icon: '/icon-192x192.png',
+              tag: `distance-${symbolName}-${breakoutTime.getTime()}`,
+              data: { symbol: breakout.symbol, type: 'distance-alert', distance: distancePercent }
+            }).then(sent => {
+              if (sent) {
+                // Mark as notified
+                notifiedBreakoutsRef.current.add(key);
+                saveNotifiedBreakouts();
+                console.log(`[Notifications] Sent DISTANCE notification for ${symbolName} (${distanceText} from range)`);
+              }
+            });
+          }
+        }
+      });
+    }
+  };
+
+  // Fetch breakout trading signals (single API call returns both signals and breakoutsWithoutReentry)
+  // This data is used by both:
+  // - RSI Analysis & Breakout Status (uses breakoutsWithoutReentry for current status)
+  // - 4H UTC+7 Breakout Trading Signals (uses signals for history)
   const fetchBreakoutSignals = async (forceRefresh = false) => {
     // Only show loading if we don't have data yet
     setBreakoutSignals(prev => {
       const hasData = prev.data && Array.isArray(prev.data) && prev.data.length > 0;
       return { ...prev, loading: !hasData, error: null };
     });
+    
+    setBreakoutsWithoutReentry(prev => {
+      const hasData = prev.data && Array.isArray(prev.data) && prev.data.length > 0;
+      return { ...prev, loading: !hasData, error: null };
+    });
 
     try {
-      // Check multiple cryptocurrencies for the last 3 days (11:00-15:00 UTC+7 range each day)
-      // This will check breakouts/re-entries from each day's 11:00 UTC+7 to next day 15:00 UTC+7
+      // Single API call returns both { signals, breakoutsWithoutReentry }
+      // Uses caching with incremental fetching (sinceDate parameter) to only get new data
       const results = await fetchMultipleBreakoutSignals(DEFAULT_SYMBOLS, 3, forceRefresh);
       const updateTime = new Date();
-      console.log(`[BreakoutSignals] Data updated at ${updateTime.toISOString()}`);
-      // Use all results (all 3 days of signals for all symbols)
-      setBreakoutSignals({ data: results, loading: false, error: null, lastUpdateTime: updateTime });
+      console.log(`[BreakoutSignals] Data updated at ${updateTime.toISOString()} - ${results.signals?.length || 0} signals, ${results.breakoutsWithoutReentry?.length || 0} breakouts`);
+      
+      // Check for new breakouts and send notifications
+      // Need to access previous state to compare
+      setBreakoutSignals(prev => {
+        const prevSignals = prev.data || [];
+        
+        // Also get previous breakoutsWithoutReentry for distance checking
+        const prevBreakoutsWithoutReentry = breakoutsWithoutReentry.data || [];
+        
+        // Check for new breakouts after state update
+        if (notificationsEnabled && notificationPermission === 'granted') {
+          // Use setTimeout to ensure state update happens first
+          setTimeout(() => {
+            checkAndNotifyNewBreakouts(
+              results.signals || [], 
+              prevSignals,
+              results.breakoutsWithoutReentry || [],
+              prevBreakoutsWithoutReentry
+            );
+          }, 100);
+        }
+        
+        return { 
+          data: results.signals || [], 
+          loading: false, 
+          error: null, 
+          lastUpdateTime: updateTime 
+        };
+      });
+      
+      setBreakoutsWithoutReentry(prev => {
+        const prevBreakouts = prev.data || [];
+        
+        return { 
+          data: results.breakoutsWithoutReentry || [], 
+          loading: false, 
+          error: null, 
+          lastUpdateTime: updateTime 
+        };
+      });
     } catch (err) {
       setBreakoutSignals(prev => ({ 
+        data: prev.data || null, // Keep existing data on error
+        loading: false, 
+        error: err.message || 'Failed to fetch breakout signals from Binance',
+        lastUpdateTime: prev?.lastUpdateTime || null
+      }));
+      
+      setBreakoutsWithoutReentry(prev => ({ 
         data: prev.data || null, // Keep existing data on error
         loading: false, 
         error: err.message || 'Failed to fetch breakout signals from Binance',
@@ -1949,69 +2678,95 @@ function App() {
     }
   };
 
-  // Fetch breakouts without re-entry
-  const fetchBreakoutsWithoutReentryData = async (forceRefresh = false) => {
-    // Only show loading if we don't have data yet
-    setBreakoutsWithoutReentry(prev => {
-      const hasData = prev.data && Array.isArray(prev.data) && prev.data.length > 0;
-      return { ...prev, loading: !hasData, error: null };
-    });
+  // Alias for backward compatibility (components may still reference this)
+  // Now just calls fetchBreakoutSignals which handles both
+  const fetchBreakoutsWithoutReentryData = fetchBreakoutSignals;
 
+  // Register service worker and check notification permission on mount
+  useEffect(() => {
+    const initNotifications = async () => {
+      // Check notification support
+      if (!isNotificationSupported()) {
+        console.warn('[Notifications] Notifications not supported in this browser');
+        return;
+      }
+
+      // Check current permission
+      const permission = getNotificationPermission();
+      setNotificationPermission(permission);
+
+      // Register service worker
+      const registration = await registerServiceWorker();
+      if (registration) {
+        setServiceWorkerRegistration(registration);
+        console.log('[Notifications] Service worker registered successfully');
+      }
+
+      // If notifications are enabled but permission is not granted, request it
+      if (notificationsEnabled && permission !== 'granted') {
+        const newPermission = await requestNotificationPermission();
+        setNotificationPermission(newPermission);
+        
+        if (newPermission !== 'granted') {
+          setNotificationsEnabled(false);
+          console.warn('[Notifications] Permission denied, disabling notifications');
+        }
+      }
+    };
+
+    initNotifications();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Save notifications enabled state to localStorage
+  useEffect(() => {
     try {
-      const results = await fetchBreakoutsWithoutReentry(DEFAULT_SYMBOLS, 3, forceRefresh);
-      const updateTime = new Date();
-      console.log(`[BreakoutsWithoutReentry] Data updated at ${updateTime.toISOString()}`);
-      setBreakoutsWithoutReentry({ data: results, loading: false, error: null, lastUpdateTime: updateTime });
-    } catch (err) {
-      setBreakoutsWithoutReentry(prev => ({ 
-        data: prev.data || null, // Keep existing data on error
-        loading: false, 
-        error: err.message || 'Failed to fetch breakouts without re-entry from Binance',
-        lastUpdateTime: prev?.lastUpdateTime || null
-      }));
+      localStorage.setItem('notifications_enabled', notificationsEnabled.toString());
+    } catch (e) {
+      console.warn('Failed to save notifications enabled state:', e);
     }
-  };
+  }, [notificationsEnabled]);
 
   // Auto-fetch all data on component mount
   useEffect(() => {
     // Fetch all data automatically when page loads
-    fetchRSIData();
-    fetchOversoldData();
-    fetchBreakoutSignals();
-    fetchBreakoutsWithoutReentryData();
+    // RSI will use cache if available, breakout features use cache with incremental fetching
+    fetchRSIData(); // Uses cache by default (forceRefresh=false)
+    fetchOversoldData(); // Uses cache by default (forceRefresh=false)
+    fetchBreakoutSignals(); // Uses cache with incremental fetching (forceRefresh=false) - returns both signals and breakoutsWithoutReentry
+    // Note: fetchBreakoutsWithoutReentryData is now an alias to fetchBreakoutSignals
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Ref to track last triggered minute to avoid duplicate triggers
-  const lastTriggeredMinuteRef = useRef(-1);
-  // Ref to track last dashboard update to avoid duplicate triggers
-  const lastDashboardUpdateRef = useRef(0);
+  // Auto-refresh RSI features on hour change (xx:00:00)
+  // This only refreshes RSI Analysis and Oversold History, not breakout features
+  const lastTriggeredHourRef = useRef(-1);
 
-  // Auto-update at the start of every minute (xx:00:00)
   useEffect(() => {
-    const checkAndUpdate = () => {
+    const checkAndUpdateRSI = () => {
       const now = new Date();
-      const seconds = now.getSeconds();
-      const currentMinute = now.getMinutes();
+      const minutes = now.getMinutes();
+      const currentHour = now.getHours();
       
-      // Check if we're at the start of a new minute (seconds is 0 or just became 0)
-      // Also check if we haven't triggered for this minute yet
-      if (seconds === 0 && currentMinute !== lastTriggeredMinuteRef.current) {
-        lastTriggeredMinuteRef.current = currentMinute;
+      // Check if we're at the start of a new hour (minutes === 0)
+      // Also check if we haven't triggered for this hour yet
+      // Allow for seconds 0-2 to catch the exact moment (since we check every 500ms)
+      if (minutes === 0 && currentHour !== lastTriggeredHourRef.current) {
+        lastTriggeredHourRef.current = currentHour;
         const timestamp = now.toISOString();
-        console.log(`[Auto-Update] Triggering updates at ${timestamp} (Minute: ${currentMinute})`);
+        console.log(`[RSI Auto-Update] Triggering RSI refresh at ${timestamp} (Hour: ${currentHour}:00:00)`);
         
-        // Trigger all updates (they will update lastUpdateTime when complete)
-        // Using forceRefresh=false to use incremental updates from cache
+        // Only refresh RSI features (these will check cache and fetch new candles if available)
+        // Using forceRefresh=false to leverage cache - it will auto-detect new hourly candles
         fetchRSIData(false);
         fetchOversoldData(false);
-        fetchBreakoutSignals(false);
-        fetchBreakoutsWithoutReentryData(false);
+        
+        // Note: Breakout features are NOT refreshed automatically - left untouched
       }
     };
 
-    // Check every 500ms to catch the moment when seconds becomes 0 more reliably
-    const intervalId = setInterval(checkAndUpdate, 500);
+    // Check every 500ms to catch the moment when we enter a new hour (minutes becomes 0)
+    const intervalId = setInterval(checkAndUpdateRSI, 500);
 
     // Cleanup on unmount
     return () => {
@@ -2022,103 +2777,167 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Empty deps - fetch functions are stable, refs persist across renders
 
-  // Dashboard-specific auto-update: Refresh RSI and Breakouts Without Re-entry more frequently (every 30 seconds)
-  // This ensures the Dashboard shows the latest actionable items more often
+  // Auto-refresh breakout features every 1 minute (since cache is disabled, fetch fresh data frequently)
+  // This refreshes both RSI Analysis & Breakout Status and 4H UTC+7 Breakout Trading Signals
+  // Since cache is disabled, always fetches fresh data
+  const lastTriggeredMinRef = useRef(-1);
+  
   useEffect(() => {
-    const dashboardUpdateInterval = setInterval(() => {
-      const now = Date.now();
-      // Update every 30 seconds (but not more than once every 30 seconds)
-      if (now - lastDashboardUpdateRef.current >= 30000) {
-        lastDashboardUpdateRef.current = now;
-        console.log(`[Dashboard] Auto-updating RSI and Breakouts Without Re-entry at ${new Date().toISOString()}`);
+    const checkAndUpdateBreakout = () => {
+      const now = new Date();
+      const seconds = now.getSeconds();
+      const minutes = now.getMinutes();
+      
+      // Check if we're at the start of a new minute (xx:00, xx:01, xx:02, etc.)
+      // Only trigger when seconds < 2 to catch the exact moment, and we haven't triggered for this minute yet
+      const shouldTrigger = seconds < 2 && minutes !== lastTriggeredMinRef.current;
+      
+      if (shouldTrigger) {
+        lastTriggeredMinRef.current = minutes;
+        const timestamp = now.toISOString();
+        const hour = now.getHours();
+        console.log(`[Breakout Auto-Update] Triggering breakout refresh at ${timestamp} (${hour}:${String(minutes).padStart(2, '0')}:00)`);
         
-        // Refresh only the data that Dashboard needs
-        fetchRSIData(false);
-        fetchBreakoutsWithoutReentryData(false);
+        // Refresh breakout features (cache is disabled, so always fetches fresh data)
+        // This single call updates both RSI Analysis & Breakout Status and 4H UTC+7 Breakout Trading Signals
+        fetchBreakoutSignals(false);
       }
-    }, 30000); // Check every 30 seconds
+    };
+
+    // Check every 500ms to catch the moment when we enter a new minute
+    const intervalId = setInterval(checkAndUpdateBreakout, 500);
 
     // Cleanup on unmount
     return () => {
-      if (dashboardUpdateInterval) {
-        clearInterval(dashboardUpdateInterval);
+      if (intervalId) {
+        clearInterval(intervalId);
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Empty deps - fetch functions are stable, refs persist across renders
 
+  // DISABLED: Auto-refresh functionality (old version - kept for reference)
+  // const lastTriggeredMinuteRef = useRef(-1);
+
+  // // Auto-update at the start of every minute (xx:00:00)
+  // useEffect(() => {
+  //   const checkAndUpdate = () => {
+  //     const now = new Date();
+  //     const seconds = now.getSeconds();
+  //     const currentMinute = now.getMinutes();
+  //     
+  //     // Check if we're at the start of a new minute (seconds is 0 or just became 0)
+  //     // Also check if we haven't triggered for this minute yet
+  //     if (seconds === 0 && currentMinute !== lastTriggeredMinuteRef.current) {
+  //       lastTriggeredMinuteRef.current = currentMinute;
+  //       const timestamp = now.toISOString();
+  //       console.log(`[Auto-Update] Triggering updates at ${timestamp} (Minute: ${currentMinute})`);
+  //       
+  //       // Trigger all updates (they will update lastUpdateTime when complete)
+  //       // Using forceRefresh=false to use incremental updates from cache
+  //       fetchRSIData(false);
+  //       fetchOversoldData(false);
+  //       fetchBreakoutSignals(false);
+  //       fetchBreakoutsWithoutReentryData(false);
+  //     }
+  //   };
+
+  //   // Check every 500ms to catch the moment when seconds becomes 0 more reliably
+  //   const intervalId = setInterval(checkAndUpdate, 500);
+
+  //   // Cleanup on unmount
+  //   return () => {
+  //     if (intervalId) {
+  //       clearInterval(intervalId);
+  //     }
+  //   };
+  //   // eslint-disable-next-line react-hooks/exhaustive-deps
+  // }, []); // Empty deps - fetch functions are stable, refs persist across renders
+
+  // Handle notification toggle
+  const handleToggleNotifications = async () => {
+    if (!notificationsEnabled) {
+      // Enable notifications - request permission
+      if (notificationPermission !== 'granted') {
+        const permission = await requestNotificationPermission();
+        setNotificationPermission(permission);
+        
+        if (permission === 'granted') {
+          setNotificationsEnabled(true);
+        } else {
+          alert('Notification permission is required to receive breakout alerts. Please enable notifications in your browser settings.');
+        }
+      } else {
+        setNotificationsEnabled(true);
+      }
+    } else {
+      // Disable notifications
+      setNotificationsEnabled(false);
+    }
+  };
+
   return (
     <div className="App">
       <header className="App-header">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', maxWidth: '1200px' }}>
+          <div>
         <h1>Crypto Signal Checker</h1>
         <p>Real-time Analysis Dashboard</p>
-        <p style={{ fontSize: '0.85rem', opacity: 0.8, marginTop: '0.5rem' }}>
+        </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+            {isNotificationSupported() && (
+          <button 
+                onClick={handleToggleNotifications}
+                style={{
+                  padding: '0.5rem 1rem',
+                  backgroundColor: notificationsEnabled && notificationPermission === 'granted' 
+                    ? 'rgba(107, 207, 127, 0.2)' 
+                    : 'rgba(255, 255, 255, 0.1)',
+                  border: `2px solid ${notificationsEnabled && notificationPermission === 'granted' ? '#6bcf7f' : 'rgba(255, 255, 255, 0.3)'}`,
+                  borderRadius: '6px',
+                  color: notificationsEnabled && notificationPermission === 'granted' ? '#6bcf7f' : '#fff',
+                  fontSize: '0.9rem',
+                  cursor: 'pointer',
+                  fontWeight: '500',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '0.5rem',
+                  transition: 'all 0.2s ease'
+                }}
+                title={notificationsEnabled && notificationPermission === 'granted' 
+                  ? 'Notifications enabled - You will receive alerts for new breakouts' 
+                  : notificationPermission === 'denied' 
+                    ? 'Notifications blocked - Enable in browser settings'
+                    : 'Click to enable notifications for breakout alerts'}
+              >
+                {notificationsEnabled && notificationPermission === 'granted' ? '🔔' : '🔕'}
+                <span>{notificationsEnabled && notificationPermission === 'granted' ? 'Notifications ON' : 'Notifications OFF'}</span>
+          </button>
+            )}
+        </div>
+        </div>
+        {/* <p style={{ fontSize: '0.85rem', opacity: 0.8, marginTop: '0.5rem' }}>
           Auto-updates at xx:00:00 every minute
-        </p>
+        </p> */}
       </header>
 
       <main className="App-main">
-        {/* Cryptocurrency Filter */}
-        <div className="controls-section" style={{ marginBottom: '1.5rem' }}>
-          <CryptoFilter
-            selectedCryptos={selectedCryptos}
-            onToggleCrypto={toggleCrypto}
-            onSelectAll={selectAllCryptos}
-            onDeselectAll={deselectAllCryptos}
-          />
-        </div>
-
-        {/* Dashboard Section - Shows actionable items */}
+        {/* Merged RSI & Breakout Status Section */}
         <div className="rsi-main-section">
-          <Dashboard
-            rsiData={rsiData}
-            breakoutsWithoutReentryData={breakoutsWithoutReentry.data}
-            selectedCryptos={selectedCryptos}
-            isExpanded={expandedSections.dashboard}
-            onToggleExpanded={() => toggleSection('dashboard')}
-            onExpandRSI={expandRSISection}
-            onExpandBreakouts={expandBreakoutsSection}
-          />
-        </div>
-
-        <div className="controls-section">
-          <button 
-            onClick={() => fetchRSIData(true)}
-            className="fetch-all-button"
-            disabled={rsiData.loading}
-          >
-            {rsiData.loading ? 'Fetching...' : 'Refresh RSI Data'}
-          </button>
-          <p className="data-source-info">
-            Fetching RSI data directly from Binance API | All times displayed in UTC+7 (Bangkok/Indochina Time)
-          </p>
-        </div>
-
-        {/* RSI Table Section */}
-        <div className="rsi-main-section">
-          <RSITable
-            data={rsiData.data}
-            loading={rsiData.loading}
-            error={rsiData.error}
-            onRefresh={fetchRSIData}
-            selectedCryptos={selectedCryptos}
-            isExpanded={expandedSections.rsi}
-            onToggleExpanded={() => toggleSection('rsi')}
-            lastUpdateTime={rsiData.lastUpdateTime}
-          />
-        </div>
-
-        {/* Oversold History Section */}
-        <div className="rsi-main-section">
-          <OversoldHistoryTable
-            data={oversoldHistory.data}
-            loading={oversoldHistory.loading}
-            error={oversoldHistory.error}
-            onRefresh={fetchOversoldData}
-            selectedCryptos={selectedCryptos}
-            isExpanded={expandedSections.oversold}
-            onToggleExpanded={() => toggleSection('oversold')}
-            lastUpdateTime={oversoldHistory.lastUpdateTime}
+          <MergedRSIBreakoutTable
+            rsiData={rsiData.data}
+            rsiLoading={rsiData.loading}
+            rsiError={rsiData.error}
+            onRefreshRSI={fetchRSIData}
+            breakoutData={breakoutsWithoutReentry.data}
+            breakoutLoading={breakoutsWithoutReentry.loading}
+            breakoutError={breakoutsWithoutReentry.error}
+            onRefreshBreakout={fetchBreakoutsWithoutReentryData}
+            breakoutSignalsData={breakoutSignals.data}
+            selectedCryptos={oversoldSelectedCryptos}
+            isExpanded={expandedSections.mergedRSIBreakout}
+            onToggleExpanded={() => toggleSection('mergedRSIBreakout')}
+            lastUpdateTime={rsiData.lastUpdateTime || breakoutsWithoutReentry.lastUpdateTime}
           />
         </div>
 
@@ -2129,24 +2948,26 @@ function App() {
             loading={breakoutSignals.loading}
             error={breakoutSignals.error}
             onRefresh={fetchBreakoutSignals}
-            selectedCryptos={selectedCryptos}
+            selectedCryptos={breakoutSignalsSelectedCryptos}
+            onToggleCrypto={toggleBreakoutSignalsCrypto}
             isExpanded={expandedSections.breakoutSignals}
             onToggleExpanded={() => toggleSection('breakoutSignals')}
             lastUpdateTime={breakoutSignals.lastUpdateTime}
           />
         </div>
 
-        {/* Breakouts Without Re-entry Section */}
+        {/* Oversold History Section */}
         <div className="rsi-main-section">
-          <BreakoutsWithoutReentryTable
-            data={breakoutsWithoutReentry.data}
-            loading={breakoutsWithoutReentry.loading}
-            error={breakoutsWithoutReentry.error}
-            onRefresh={fetchBreakoutsWithoutReentryData}
-            selectedCryptos={selectedCryptos}
-            isExpanded={expandedSections.breakoutsWithoutReentry}
-            onToggleExpanded={() => toggleSection('breakoutsWithoutReentry')}
-            lastUpdateTime={breakoutsWithoutReentry.lastUpdateTime}
+          <OversoldHistoryTable
+            data={oversoldHistory.data}
+            loading={oversoldHistory.loading}
+            error={oversoldHistory.error}
+            onRefresh={fetchOversoldData}
+            selectedCryptos={oversoldSelectedCryptos}
+            onToggleCrypto={toggleOversoldCrypto}
+            isExpanded={expandedSections.oversold}
+            onToggleExpanded={() => toggleSection('oversold')}
+            lastUpdateTime={oversoldHistory.lastUpdateTime}
           />
         </div>
       </main>
